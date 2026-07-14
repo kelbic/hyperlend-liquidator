@@ -146,6 +146,9 @@ collateral — exactly the designed behavior.
 
 ## Operator go-live (after review) — the ONLY live steps
 
+0. **Backfill the borrower book once** (so older open positions aren't missed on a cold start):
+   `HL_DEPLOY_BLOCK=779363 HL_LOG_CHUNK=8000 python3 -u -m analysis.monitor`. Persists to
+   `data/book.json`; thereafter it's incremental. (Pool deploy block 779363 verified on-chain.)
 1. **Put a key in place**: `~/.hyperlend-bot/key` (chmod 600), fund the owner wallet with a little
    **HYPE** for gas.
 2. **Deploy the contract** (one on-chain tx):

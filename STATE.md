@@ -97,10 +97,16 @@ calm market (the option is dormant until a crash).
    Tokyo colo. Accepted. Mitigation is presence + reliability, not speed.
 5. **kHYPE / PT / sUSDe route depth** varies; the bot skips no-route pairs and gates on price
    impact (`HL_MAX_IMPACT=5%`), so a thin route just means a declined target, never a loss.
-6. **Book warmth on cold start.** First run only sees `HL_INCR_WINDOW` (20k blocks) of borrowers;
-   run once with `HL_DEPLOY_BLOCK=<pool deploy block>` to backfill the full history, then the book
-   persists. (Pool deploy block not pinned here — find via first Pool tx; not required for calm-market
-   operation since the near-edge set refreshes each pass.)
+6. **Book warmth on cold start — RUN THE BACKFILL FIRST.** A fresh start only sees borrowers active
+   in the last `HL_INCR_WINDOW` (~20k blocks ≈ 5.5h), so **older open positions are missed until they
+   act again** (observed live: a fresh book had 28 borrowers and 0 near-edge, vs. the 3 real near-edge
+   kHYPE positions that had borrowed >5.5h earlier). Fix is a one-time full backfill from the pinned
+   **Pool deploy block 779363** (binary-searched on historical `eth_getCode`):
+   `HL_DEPLOY_BLOCK=779363 HL_LOG_CHUNK=8000 python3 -u -m analysis.monitor`. The book then persists
+   (`data/book.json`) and grows monotonically. getLogs is chunked (drpc HTTP-400s ranges >~8-9k; the
+   chunker halves on error, so the backfill is correct, just ~thousands of requests → run once). A
+   production optimization would be a HyperLend positions API/subgraph if one exists (operator to
+   check); the on-chain backfill is the no-third-party fallback.
 
 ## Next steps (operator, after review)
 

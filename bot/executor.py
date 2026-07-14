@@ -231,9 +231,9 @@ def once(st: dict | None = None, book: dict | None = None) -> int:
     if book is None:
         book = load_book()
 
+    # scan() mutates `book` in place (borrowers/last_block/configs) and returns the same object,
+    # so there is nothing to copy back — `book` is already current for save_book below.
     r = scan(rpc, book, min_debt_usd=C.MIN_DEBT_USD, watch_hf=C.WATCH_HF, report_hf=C.REPORT_HF)
-    book.clear()
-    book.update(r["book"])
     st["passes"] += 1
 
     ok, reason = guard_ok(st)

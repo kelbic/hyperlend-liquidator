@@ -24,6 +24,7 @@ UI_POOL_DATA_PROVIDER = "0xfc05a3fbf47094f53a8f98fda5dd8abdd336b9d4"  # UiPoolDa
 ACL_MANAGER = "0x10914Ee2C2dd3F3dEF9EFFB75906CA067700a04A"
 MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
+POOL_DEPLOY_BLOCK = 779363       # Pool proxy first has code here (binary-searched) — backfill start
 FLASHLOAN_PREMIUM_BPS = 4        # FLASHLOAN_PREMIUM_TOTAL read on-chain = 4 (0.04%)
 ORACLE_BASE_UNIT = 10 ** 8       # AaveOracle.BASE_CURRENCY_UNIT (USD with 8 decimals)
 CLOSE_FACTOR_HF_THRESHOLD = 0.95  # HyperLend: HF<0.95 (or debt<$2k) => 100% closable, else 50%
