@@ -1,6 +1,16 @@
 # STATE — hyperlend-liquidator
 
-**As of 2026-07-14. Status: DRY-RUN, reviewed-ready. Nothing deployed; zero transactions sent.**
+**As of 2026-07-14. Status: 🟢 LIVE (DRY_RUN=0).**
+
+Deployed & running:
+- Contract `HyperLendLiquidator` = **`0xCBAB63AA7F8fA7F15445e85e64b2ADe4fEeC2bd6`** on HyperEVM (owner/bot key `0x46345D0c63eAa4d24002b099D4040A6BD8d673E3`).
+- Gas funded via Relay (Base ETH → HYPE): started 0.0404 HYPE (~$2.6). Deploy tx `0x42602eec…`.
+- Book backfilled from Pool deploy block 779363 → **25,469 borrowers** (`data/book.json`), full HF sweep each pass.
+- Autonomy: flock single-instance (`/tmp/hyperlend-executor.lock` + `~/.hyperlend-bot/executor.lock`), cron watchdog (`@reboot` + every-minute) via `~/.hyperlend-bot/run.sh`, daemonized (ppid 1).
+- Recipient risk closed by fork-test (see risk #1). DRY-live confirmed with the deployed contract (book 25469, near-edge 53, targets 0 in calm). First real liquidation = end-to-end calibration; revert-safe + kill-switch ($5/day gas, 3 consec reverts).
+- Config `~/.hyperlend-bot/env` (DRY_RUN=0, HL_MIN_PROFIT=25, HL_MAX_IMPACT=0.05). TG alerts on fire/revert/kill-switch only (chat 265715923); ▶️ start alert fired.
+
+_Original build/review notes below (kept for reference)._
 
 This is a cheap-option addition to the 3 live Morpho liquidators. It targets **mid-tier
 ($10k–$50k) liquidation spillover** on HyperLend during crash bursts — NOT whale tickets (those are
