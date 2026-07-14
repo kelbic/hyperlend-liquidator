@@ -1,0 +1,24 @@
+# secrets — NEVER commit keys, passwords, env
+.env
+*.key
+key
+pw
+.hyperlend-bot/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/
+
+# runtime state / logs / data snapshots
+data/*.json
+data/*.log
+data/*.jsonl
+!data/.gitkeep

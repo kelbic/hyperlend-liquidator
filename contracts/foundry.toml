@@ -1,0 +1,17 @@
+[profile.default]
+src = "src"
+out = "out"
+test = "test"
+script = "script"
+libs = ["lib"]
+solc = "0.8.23"
+optimizer = true
+optimizer_runs = 200
+fs_permissions = [{ access = "read", path = "./" }]
+
+# HyperEVM mainnet fork target for tests. chainId 999; standard EVM — HyperLend is an Aave-v3.6
+# fork so the flashLoanSimple -> liquidationCall path is byte-identical to Aave. Set HL_RPC_URL to
+# run the fork tests; the fork test early-returns green when it is unset (so CI without an RPC
+# still passes). The pure/unit test always runs.
+[rpc_endpoints]
+hyperevm = "${HL_RPC_URL}"

@@ -1,0 +1,32 @@
+# systemd unit for the live executor. Resilient autostart + anti-crashloop.
+# Install (needs sudo):
+#   sudo cp bot/hyperlend-executor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hyperlend-executor
+# Logs:  journalctl -u hyperlend-executor -f
+# Stop:  sudo systemctl stop hyperlend-executor
+#
+# Live mode is enabled in ~/.hyperlend-bot/env: DRY_RUN=0 (code default is 1 = safe).
+# The kill-switch stops the loop on a limit breach — then investigate,
+# `python3 -m bot.executor reset`, and `systemctl start hyperlend-executor`.
+# The executor also holds a flock (~/.hyperlend-bot/executor.lock) so a stray second copy exits.
+
+[Unit]
+Description=HyperLend Aave-v3 liquidator executor (HyperEVM, chainId 999)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude-agent
+WorkingDirectory=/home/claude-agent/hyperlend-liquidator
+EnvironmentFile=/home/claude-agent/.hyperlend-bot/env
+ExecStart=/usr/bin/python3 -u -m bot.executor loop
+Restart=on-failure
+RestartSec=10
+# anti-crashloop: at most 5 restarts / 5 min, else the unit gives up (needs intervention)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

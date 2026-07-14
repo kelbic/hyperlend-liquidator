@@ -1,0 +1,7 @@
+# Read-only monitor + executor default path: STDLIB ONLY except the two ABI helpers below,
+# which are already importable system-wide in this env. The executor's default signing path uses
+# `cast` (foundry) — no python signing deps. Pin these for a clean venv:
+#   pip install -r requirements.txt
+eth-utils>=4.0      # keccak (selectors / event topic0)
+eth-abi>=5.0        # only needed if you enable the in-process raw-tx signer (HL_RAW_TX=1)
+eth-account>=0.11   # only needed for HL_RAW_TX=1 (cast path needs none of these)
