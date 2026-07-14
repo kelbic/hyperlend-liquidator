@@ -80,10 +80,19 @@ calm market (the option is dormant until a crash).
 
 ## Honest risks / gaps (for the operator to close before/at go-live)
 
-1. **LiquidSwap output recipient (fork-test this).** The `/v2/route` calldata bakes the swap; I did
-   not confirm on a fork that the Router sends output to `msg.sender` (our contract) vs a baked
-   recipient. If it routes elsewhere, the contract's `CannotRepay` check reverts the whole tx →
-   **no loss**, just a missed liq. Confirm on an `anvil --fork` before live so misses aren't silent.
+1. **LiquidSwap output recipient — ✅ CLOSED (fork-tested 2026-07-14, `contracts/test/ForkSwap.t.sol`).**
+   Forked HyperEVM at latest, wrapped 1 native→WHYPE, approved the real Router `0x744489ee…2f7a`,
+   called a live `/v2/route` WHYPE→USDC calldata, and asserted the output landed on the CALLER:
+   **`USDC delivered to msg.sender (caller): 64961300` (64.96 USDC) → PASS.** The `/v2/route` API
+   takes no recipient param (probed `to/from/receiver/recipient/…` — none bake an address); the
+   router forwards final output to `msg.sender` = our contract, exactly what `executeOperation`
+   needs. Revert-safe regardless (`CannotRepay`), but now positively confirmed.
+1b. **LiquidSwap deadline buffer is TIGHT (~quote time, ≤~1 min).** Fork test: warp to fetch−15s →
+   PASS, warp to fetch+60/+300/+900s → FAIL (deadline expired). The bot's `evaluate()`→`fire()` runs
+   in the same pass (route fetched immediately before signing) and HyperEVM blocks are ~1s, so normal
+   inclusion (1–2s) is well inside the buffer. RISK: in an extreme crash-burst congestion, if block
+   inclusion lags past the deadline the swap reverts → `CannotRepay` → whole tx reverts (**no loss**,
+   missed liq). Accepted for the cheap option; mitigation is the already-immediate quote→fire flow.
 2. **No mainnet liquidation has been executed** (by design). The flash→liq→swap→repay path is
    unit-tested against mocks and every address is verified, but the first real fill should be a
    fork test (there is currently no HF<1 position to test against on live). Gas limit 2.5M is
