@@ -18,7 +18,5 @@ contracts/broadcast/
 contracts/lib/
 
 # runtime state / logs / data snapshots
-data/*.json
-data/*.log
-data/*.jsonl
+data/*
 !data/.gitkeep
