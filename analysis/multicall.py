@@ -58,10 +58,14 @@ def decode_aggregate3(result_hex: str) -> list[tuple[bool, str]]:
     return out
 
 
-def multicall(rpc, calls: list[tuple[str, str]], chunk: int = 80,
-              gas: int = 50_000_000) -> list[tuple[bool, str]]:
+def multicall(rpc, calls: list[tuple[str, str]], chunk: int = 500,
+              gas: int | None = None) -> list[tuple[bool, str]]:
     """Batched aggregate3 over an Rpc (eth_call only). Chunked so a single response stays under
-    public-endpoint size limits; bounded retries per chunk."""
+    public-endpoint size limits; bounded retries per chunk.
+
+    gas defaults to None (omit the eth_call gas cap -> the node picks its default). Some HyperEVM
+    endpoints (rpc.hyperliquid.xyz) reject an explicit 50M eth_call gas as "intrinsic gas too high"
+    on small-block state; omitting it works on every reachable endpoint (verified 2026-07-15)."""
     import time
 
     out = []
