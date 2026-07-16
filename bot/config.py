@@ -60,6 +60,9 @@ HOT_POLL_SEC = float(os.environ.get("HL_HOT_POLL_SEC", "1"))    # cadence when n
 MAX_DAILY_GAS_USD = float(os.environ.get("HL_MAX_DAILY_GAS_USD", "5"))
 MAX_CONSEC_REVERTS = int(os.environ.get("HL_MAX_CONSEC_REVERTS", "3"))
 DEDUP_SEC = float(os.environ.get("HL_DEDUP_SEC", "60"))
+# a REVERTED target must NOT be retried next pass (3 quick reverts on one bad target would trip
+# the kill-switch) — block it for this cooldown instead
+REVERT_COOLDOWN_SEC = float(os.environ.get("HL_REVERT_COOLDOWN_SEC", "300"))
 HEARTBEAT_SEC = float(os.environ.get("HL_HEARTBEAT_SEC", "0"))  # OFF by default (quiet cadence)
 
 RAW_TX = os.environ.get("HL_RAW_TX", "0") == "1"               # 0 = cast (default), 1 = eth_account

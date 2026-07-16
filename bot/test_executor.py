@@ -1,0 +1,82 @@
+"""Offline unit tests for the executor's dedup / evaluate plumbing (no network). Run:
+PYTHONPATH=. python3 bot/test_executor.py
+
+Covers the two live-loop regressions fixed 2026-07-16:
+  * a REVERTED target must be blocked for REVERT_COOLDOWN_SEC (immediate retries burned the
+    3-revert kill-switch budget on a single bad target),
+  * evaluate() must quote the FEE-ADJUSTED seized amount and charge the flash premium on the
+    full tx param while only the actual pull consumes proceeds.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+from bot import config as C          # noqa: E402
+from bot import executor as E        # noqa: E402
+from bot import liqd                 # noqa: E402
+
+
+def test_recently_fired_blocks_after_revert():
+    st = {"sent": {"0xabc": {"ts": 1000.0, "status": "revert"}}}
+    # immediately after the revert: blocked (must NOT retry next pass)
+    assert E.recently_fired(st, "0xabc", 1000.0 + 5)
+    assert E.recently_fired(st, "0xabc", 1000.0 + C.REVERT_COOLDOWN_SEC - 1)
+    # after the cooldown: free again
+    assert not E.recently_fired(st, "0xabc", 1000.0 + C.REVERT_COOLDOWN_SEC + 1)
+
+
+def test_recently_fired_ok_uses_dedup_sec():
+    st = {"sent": {"0xabc": {"ts": 1000.0, "status": "ok"}}}
+    assert E.recently_fired(st, "0xabc", 1000.0 + C.DEDUP_SEC - 1)
+    assert not E.recently_fired(st, "0xabc", 1000.0 + C.DEDUP_SEC + 1)
+    assert not E.recently_fired(st, "0xnew", 1000.0)
+
+
+def test_evaluate_uses_fee_adjusted_seized_and_pulled():
+    # USDT0 debt (6 dec, $1), WHYPE collateral: full close of a $1500 leg.
+    # seized = fee-adjusted (received) amount; debt_to_cover overshoots; pulled = actual.
+    t = {
+        "seized": 109 * 10 ** 18 // 100,          # 1.09 WHYPE received (fee-adjusted)
+        "debt_to_cover": 1515 * 10 ** 6,          # overshot tx param (+1%)
+        "debt_pulled": 1500 * 10 ** 6,            # actual pull the Pool will make
+        "coll_asset": "0xc", "debt_asset": "0xd", "coll_dec": 18, "debt_dec": 6,
+        "debt_price": 100_000_000,
+    }
+    captured = {}
+
+    def fake_quote(coll, debt, seized_wei, coll_dec, debt_dec):
+        captured["seized_wei"] = seized_wei
+        return {"amount_out": 1630 * 10 ** 6, "price_impact": 0.001,
+                "swap_target": "0xrouter", "swap_calldata": "0xcd", "amount_in_used": 0}
+
+    orig = liqd.quote_for_seized
+    liqd.quote_for_seized = fake_quote
+    try:
+        ev = E.evaluate(t, gas_usd=0.01)
+    finally:
+        liqd.quote_for_seized = orig
+
+    # the quote input is the fee-adjusted seized figure, untouched
+    assert captured["seized_wei"] == t["seized"]
+    # premium charged on the FULL flashed amount, proceeds consumed by the actual pull only
+    premium = (t["debt_to_cover"] * C.FLASH_PREMIUM_BPS + 9999) // 10000
+    assert ev["owed"] == t["debt_pulled"] + premium
+    assert ev["net_wei"] == 1630 * 10 ** 6 - ev["owed"]
+
+
+if __name__ == "__main__":
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    failed = 0
+    for fn in fns:
+        try:
+            fn()
+            print(f"PASS {fn.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"FAIL {fn.__name__}: {e}")
+    print(f"\n{len(fns) - failed}/{len(fns)} passed")
+    sys.exit(1 if failed else 0)

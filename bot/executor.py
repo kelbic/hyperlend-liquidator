@@ -91,8 +91,17 @@ def guard_ok(st: dict) -> tuple[bool, str]:
 
 
 def recently_fired(st: dict, key: str, now_ts: float) -> bool:
+    """Dedup: a fired target is blocked for DEDUP_SEC; a REVERTED target is blocked for the
+    longer REVERT_COOLDOWN_SEC — retrying the same borrower next pass just burns the remaining
+    consec-revert budget and trips the kill-switch on one bad target (katana lesson: reverts
+    must not be retried immediately)."""
     rec = st["sent"].get(key)
-    return bool(rec and (now_ts - rec["ts"]) < C.DEDUP_SEC and rec.get("status") != "revert")
+    if not rec:
+        return False
+    age = now_ts - rec["ts"]
+    if rec.get("status") == "revert":
+        return age < C.REVERT_COOLDOWN_SEC
+    return age < C.DEDUP_SEC
 
 
 # --------------------------------------------------------------------------- telegram (optional)
@@ -135,9 +144,16 @@ def fresh_hf(rpc: Rpc, borrower: str) -> float | None:
 # --------------------------------------------------------------------------- evaluate
 def evaluate(t: dict, gas_usd: float) -> dict | None:
     """Quote the exit for target `t` on LiquidSwap and gate on net profit. Returns fire params
-    (swap_target, swap_calldata, min_profit_wei, net_usd, ...) or None if not profitable."""
+    (swap_target, swap_calldata, min_profit_wei, net_usd, ...) or None if not profitable.
+
+    `t['seized']` is what we actually RECEIVE (net of the liquidation protocol fee — 10% of the
+    bonus goes to the treasury), so the swap amountIn haircut and all proceeds math sit on top
+    of the fee-adjusted figure. `t['debt_to_cover']` is the tx param / flash amount (overshoots
+    on full closes; the Pool clamps and pulls only `t['debt_pulled']` — the unpulled flash cash
+    flows straight back into the repayment, so only the premium is charged on the full amount)."""
     seized = t["seized"]
     debt_to_cover = t["debt_to_cover"]
+    debt_pulled = t.get("debt_pulled", debt_to_cover)
     if seized <= 0 or debt_to_cover <= 0:
         return None
     try:
@@ -149,13 +165,13 @@ def evaluate(t: dict, gas_usd: float) -> dict | None:
         return {"skip": f"quote error: {e}"}
 
     proceeds = q["amount_out"]                                   # debt-asset wei out of the swap
-    # flash-loan repayment: principal + premium (0.04%). Capital path repays only the principal
-    # implicitly (it spent its own balance), so owed == debt_to_cover.
+    # what the liquidation consumes: the ACTUAL pull (<= debt_to_cover) + the flash premium
+    # (0.04%), which IS charged on the full flashed amount. Capital path repays only the pull.
     if C.USE_FLASHLOAN:
         premium = (debt_to_cover * C.FLASH_PREMIUM_BPS + 9999) // 10000
-        owed = debt_to_cover + premium
+        owed = debt_pulled + premium
     else:
-        owed = debt_to_cover
+        owed = debt_pulled
     net_wei = proceeds - owed
     dprice = t["debt_price"]
     net_usd = net_wei / 10 ** t["debt_dec"] * dprice / ORACLE_BASE_UNIT - gas_usd
@@ -253,7 +269,7 @@ def once(st: dict | None = None, book: dict | None = None) -> int:
         raise GuardTripped(reason)
 
     gas_usd = gas_cost_usd(rpc)
-    for t in sorted(targets, key=lambda x: -(x.get("gross_bonus_usd") or 0)):
+    for t in sorted(targets, key=lambda x: -(x.get("net_bonus_usd") or 0)):
         key = t["borrower"]
         if recently_fired(st, key, now_ts):
             continue
@@ -262,6 +278,12 @@ def once(st: dict | None = None, book: dict | None = None) -> int:
             print(f"  skip {key[:10]}…: HF cured to {hf_now:.4f} before fire")
             continue
         ev = evaluate(t, gas_usd)
+        # no route on the primary collateral (e.g. exotic Pendle PT) -> try the runner-up leg
+        if ev and "skip" in ev and "no LiquidSwap route" in ev["skip"] and t.get("alt"):
+            print(f"  skip {key[:10]}… {t['coll_sym']}->{t['debt_sym']}: {ev['skip']}; "
+                  f"falling back to {t['alt']['coll_sym']}")
+            t = t["alt"]
+            ev = evaluate(t, gas_usd)
         if ev is None:
             continue
         if "skip" in ev:
@@ -305,24 +327,47 @@ def _acquire_lock():
     return fh  # keep the handle alive for the process lifetime
 
 
+def _kill_alert(st: dict, msg: str) -> None:
+    """The cron watchdog resurrects this process every minute — throttle the kill-switch alert
+    (katana pattern) so a tripped guard doesn't turn Telegram into a firehose."""
+    print(msg)
+    if time.time() - st.get("last_kill_alert", 0) > 900:
+        st["last_kill_alert"] = time.time()
+        alert(msg)
+
+
 def loop() -> None:
     lock = _acquire_lock()  # noqa: F841 (held for process lifetime)
     st = load_state()
     book = load_book()
-    alert(f"▶️ hyperlend executor started (DRY_RUN={'on' if C.DRY_RUN else 'OFF'}, "
-          f"path={'flash' if C.USE_FLASHLOAN else 'capital'}, min_profit ${C.MIN_PROFIT_USD}, "
-          f"contract={'set' if C.CONTRACT else 'NONE'}, kill-switch gas ${C.MAX_DAILY_GAS_USD}/day, "
-          f"{C.MAX_CONSEC_REVERTS} reverts).")
+    ok, reason = guard_ok(st)
+    if not ok and not C.DRY_RUN:
+        # kill-switch already tripped: exit quietly with a throttled alert instead of spamming a
+        # start + kill message on every cron respawn (~2 msg/min otherwise)
+        _kill_alert(st, f"🛑 KILL-SWITCH still tripped: {reason}. Waiting for intervention "
+                        f"(python3 -m bot.executor reset, then restart).")
+        save_state(st)
+        sys.exit(1)
+    banner = (f"▶️ hyperlend executor started (DRY_RUN={'on' if C.DRY_RUN else 'OFF'}, "
+              f"path={'flash' if C.USE_FLASHLOAN else 'capital'}, min_profit ${C.MIN_PROFIT_USD}, "
+              f"contract={'set' if C.CONTRACT else 'NONE'}, kill-switch gas ${C.MAX_DAILY_GAS_USD}/day, "
+              f"{C.MAX_CONSEC_REVERTS} reverts).")
+    print(banner)
+    # throttle repeat start banners too — a crash-loop under the cron watchdog must not spam
+    if time.time() - st.get("last_start_alert", 0) > 600:
+        st["last_start_alert"] = time.time()
+        save_state(st)
+        alert(banner)
     st["last_heartbeat"] = time.time()
     while True:
         try:
             n = once(st, book)
             wait = C.HOT_POLL_SEC if n else C.POLL_SEC
         except GuardTripped as g:
-            alert(f"🛑 KILL-SWITCH: {g}. Executor stopped — needs intervention "
-                  f"(python3 -m bot.executor reset, then restart).")
+            _kill_alert(st, f"🛑 KILL-SWITCH: {g}. Executor stopped — needs intervention "
+                            f"(python3 -m bot.executor reset, then restart).")
             save_state(st)
-            return
+            sys.exit(1)   # non-zero: the watchdog must see FAILURE, not a clean exit
         except Exception as e:
             print(f"loop err: {e}")
             wait = C.POLL_SEC
