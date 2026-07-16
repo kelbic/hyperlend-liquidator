@@ -10,6 +10,24 @@ Deployed & running:
 - Recipient risk closed by fork-test (see risk #1). DRY-live confirmed with the deployed contract (book 25469, near-edge 53, targets 0 in calm). First real liquidation = end-to-end calibration; revert-safe + kill-switch ($5/day gas, 3 consec reverts).
 - Config `~/.hyperlend-bot/env` (DRY_RUN=0, HL_MIN_PROFIT=25, HL_MAX_IMPACT=0.05). TG alerts on fire/revert/kill-switch only (chat 265715923); ▶️ start alert fired.
 
+**2026-07-16 review fixes (verified on-chain + fork-tested):**
+- **liquidationProtocolFee modeled** — treasury takes 1000 bps (10%) of the liquidation BONUS on
+  every reserve (`getLiquidationProtocolFee`, read per reserve into the book configs); we receive
+  the fee-adjusted amount (1.090x at bonus 1.10 — matches all 16 historical liquidations). All
+  sizing/quotes/net math now use the fee-adjusted seized figure.
+- **MustNotLeaveDust + per-reserve close factor modeled** — sizing only produces revert-free
+  shapes: full debt close / full collateral seize (debtToCover overshoots 1%; the Pool clamps) /
+  partial leaving >= $1000(+5% margin) on both legs. Close factor mirrors the deployed lib:
+  100% unless reserve debt AND collateral >= $2000 and HF > 0.95, else 50% of TOTAL debt.
+- **Kill-switch alert spam fixed** (katana pattern): reverted targets get a 300s cooldown,
+  kill-switch alert throttled 1/900s, start banner 1/600s, respawn with tripped guard exits
+  quietly. Debt-leg sort fixed (largest value primary); runner-up collateral leg as no-route
+  fallback. `~/.hyperlend-bot/deadman.sh` added (log silent >600s -> TG, 1/hour).
+- **Risk #2 CLOSED** — `contracts/test/ForkLiquidation.t.sol` (3/3 vs live Pool, no archive
+  needed: real position + mocked oracle price): fee-adjusted receipt = 1.090x exactly,
+  debtToCover overshoot clamped to full close, dust revert at <$1000 leftover (passes >$1000),
+  uint.max clamped to the 50% close factor.
+
 _Original build/review notes below (kept for reference)._
 
 This is a cheap-option addition to the 3 live Morpho liquidators. It targets **mid-tier
