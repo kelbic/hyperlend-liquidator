@@ -100,8 +100,9 @@ def quote(token_in: str, token_out: str, amount_in_wei: int, in_decimals: int, o
 
 def quote_for_seized(coll_token: str, debt_token: str, seized_wei: int, coll_decimals: int,
                      debt_decimals: int, haircut: float = SWAP_INPUT_HAIRCUT) -> dict:
-    """Quote the exit for a liquidation that will seize `seized_wei` of collateral, applying the
-    drift-safety haircut so the baked amountIn <= the real seized amount."""
+    """Quote the exit for a liquidation that will RECEIVE `seized_wei` of collateral (already net
+    of the liquidation protocol fee — the caller passes the fee-adjusted figure), applying the
+    drift-safety haircut on top so the baked amountIn <= the real received amount."""
     amount_in = int(seized_wei * (1.0 - haircut))
     q = quote(coll_token, debt_token, amount_in, coll_decimals, debt_decimals)
     q["haircut"] = haircut

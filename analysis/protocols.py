@@ -27,8 +27,22 @@ MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 POOL_DEPLOY_BLOCK = 779363       # Pool proxy first has code here (binary-searched) — backfill start
 FLASHLOAN_PREMIUM_BPS = 4        # FLASHLOAN_PREMIUM_TOTAL read on-chain = 4 (0.04%)
 ORACLE_BASE_UNIT = 10 ** 8       # AaveOracle.BASE_CURRENCY_UNIT (USD with 8 decimals)
-CLOSE_FACTOR_HF_THRESHOLD = 0.95  # HyperLend: HF<0.95 (or debt<$2k) => 100% closable, else 50%
-SMALL_DEBT_FULL_CLOSE_USD = 2000  # debt below this is 100% closable regardless of HF
+
+# --- LiquidationLogic constants (verified against the deployed lib 0x8dc095f2…8104 + aave-v3-
+# origin source, 2026-07-16). The close factor is PER-RESERVE: the 50% cap only applies when the
+# targeted reserve's debt AND collateral are both >= $2000 AND HF > 0.95; otherwise the reserve is
+# 100% closable. A partial liquidation (neither all debt repaid nor all collateral seized) must
+# leave BOTH leftovers >= $1000 or the Pool reverts with MustNotLeaveDust.
+CLOSE_FACTOR_HF_THRESHOLD = 0.95   # CLOSE_FACTOR_HF_THRESHOLD = 0.95e18
+MAX_CF_THRESHOLD_USD = 2000        # MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD = 2000e8
+MIN_LEFTOVER_USD = 1000            # MIN_LEFTOVER_BASE = 1000e8 (MustNotLeaveDust floor)
+DEFAULT_CLOSE_FACTOR_BPS = 5000    # DEFAULT_LIQUIDATION_CLOSE_FACTOR = 50% (of TOTAL debt, in base)
+
+# liquidationProtocolFee: share of the liquidation BONUS that goes to the treasury, NOT to us.
+# Read on-chain (PoolDataProvider.getLiquidationProtocolFee) = 1000 bps (10%) for ALL reserves
+# (2026-07-16), and empirically confirmed on 16 real liquidations (received/repaid = 1.090 at
+# bonus 1.10, 1.135 at 1.15). load_reserves() re-reads it per reserve; this is the fallback.
+LIQ_PROTOCOL_FEE_BPS = 1000
 
 # --- token registry (symbol/decimals verified on-chain 2026-07-14) --------------------------
 # `bonus_bps` is the on-chain liquidationBonus factor (10000 = par). Verified per asset.

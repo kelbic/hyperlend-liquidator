@@ -45,7 +45,7 @@ def main() -> None:
     for t in candidates:
         tag = "TARGET(HF<1)" if t["hf"] < 1.0 else f"promoted watch HF={t['hf']:.4f}"
         print(f"--- {t['coll_sym']}->{t['debt_sym']} {t['borrower'][:12]}… [{tag}] "
-              f"cover=${t['repaid_usd']:,.0f} seized={t['seized']} bonus≈${t['gross_bonus_usd']:,.0f}")
+              f"cover=${t['repaid_usd']:,.0f} seized={t['seized']} bonus≈${t['net_bonus_usd']:,.0f}")
         ev = E.evaluate(t, gas_usd)
         if ev is None:
             print("    evaluate -> None (unsized)"); continue

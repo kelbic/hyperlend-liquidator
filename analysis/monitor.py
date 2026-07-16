@@ -24,14 +24,15 @@ import os
 import time
 
 from analysis.aave import (
-    HF_INFINITY, SEL_GET_ASSET_PRICE, SEL_GET_RESERVE_CONFIG, SEL_GET_RESERVES_LIST,
-    SEL_GET_USER_ACCOUNT_DATA, SEL_GET_USER_RESERVE_DATA, close_factor, decode_address_array,
-    decode_reserve_config, decode_user_account_data, decode_user_reserve_data, size_liquidation,
+    HF_INFINITY, SEL_GET_ASSET_PRICE, SEL_GET_LIQ_PROTOCOL_FEE, SEL_GET_RESERVE_CONFIG,
+    SEL_GET_RESERVES_LIST, SEL_GET_USER_ACCOUNT_DATA, SEL_GET_USER_RESERVE_DATA,
+    decode_address_array, decode_reserve_config, decode_user_account_data,
+    decode_user_reserve_data, size_liquidation,
 )
 from analysis.multicall import multicall
 from analysis.protocols import (
-    ADDR_TO_SYMBOL, ORACLE, ORACLE_BASE_UNIT, POOL, POOL_DATA_PROVIDER, TOPIC_BORROW,
-    is_stable, sym,
+    ADDR_TO_SYMBOL, LIQ_PROTOCOL_FEE_BPS, ORACLE, ORACLE_BASE_UNIT, POOL, POOL_DATA_PROVIDER,
+    TOPIC_BORROW, is_stable, sym,
 )
 from analysis.rpc import Rpc, get_logs_chunked
 
@@ -83,20 +84,29 @@ def discover_borrowers(rpc: Rpc, book: dict, to: int) -> set[str]:
 
 # --- reserve config cache ------------------------------------------------------
 def load_reserves(rpc: Rpc, book: dict) -> dict:
-    """{reserve_addr: {decimals, liquidation_bonus, liquidation_threshold, is_active, is_frozen}}
-    Cached in the book; refreshed if empty. Bonuses can move on governance, so the executor also
-    re-reads them, but for scan sizing the cache is fine (refreshed each cold start)."""
+    """{reserve_addr: {decimals, liquidation_bonus, liquidation_fee, liquidation_threshold,
+    is_active, is_frozen}}. Cached in the book; refreshed if empty or if the cache predates the
+    liquidation_fee field. Bonuses/fees can move on governance, so the cache is refreshed each
+    cold start."""
     cfg = book.get("configs") or {}
-    if cfg:
+    if cfg and all("liquidation_fee" in v for v in cfg.values()):
         return {k.lower(): v for k, v in cfg.items()}
     reserves = decode_address_array(rpc.eth_call(POOL, SEL_GET_RESERVES_LIST))
     res = multicall(rpc, [(POOL_DATA_PROVIDER, SEL_GET_RESERVE_CONFIG + a[2:].rjust(64, "0"))
                           for a in reserves])
+    # liquidationProtocolFee (bps of the BONUS -> treasury): read per reserve alongside the
+    # bonuses; verified 1000 (10%) on all reserves 2026-07-16, constant is the fallback.
+    fres = multicall(rpc, [(POOL_DATA_PROVIDER, SEL_GET_LIQ_PROTOCOL_FEE + a[2:].rjust(64, "0"))
+                           for a in reserves])
+    fees = {}
+    for a, (ok, ret) in zip(reserves, fres):
+        fees[a.lower()] = int(ret[2:66], 16) if ok and len(ret) >= 66 else LIQ_PROTOCOL_FEE_BPS
     out = {}
     for a, (ok, ret) in zip(reserves, res):
         if ok and len(ret) >= 2 + 10 * 64:
             c = decode_reserve_config(ret)
             out[a.lower()] = {"decimals": c["decimals"], "liquidation_bonus": c["liquidation_bonus"],
+                              "liquidation_fee": fees.get(a.lower(), LIQ_PROTOCOL_FEE_BPS),
                               "liquidation_threshold": c["liquidation_threshold"],
                               "is_active": c["is_active"], "is_frozen": c["is_frozen"]}
     book["configs"] = out
@@ -109,7 +119,8 @@ def scan(rpc: Rpc | None = None, book: dict | None = None,
          report_hf: float = REPORT_HF) -> dict:
     """One pass. Returns {block, n_positions, targets:[HF<1 & sized], risk:[HF<report_hf], book}.
     Each target row carries everything the executor needs to fire: debt/coll assets + decimals,
-    debtToCover (wei), expected seized (wei), prices, HF, close factor."""
+    debtToCover (wei, may overshoot on full closes — the Pool clamps), expected received
+    collateral (wei, net of the liquidation protocol fee), prices, HF, close factor."""
     rpc = rpc or Rpc()
     book = book if book is not None else load_book()
     to = rpc.block_number()
@@ -174,11 +185,10 @@ def scan(rpc: Rpc | None = None, book: dict | None = None,
 
 
 def _build_row(borrower: str, acct: dict, ureserves: dict, cfg: dict, prices: dict) -> dict | None:
-    """Pick the best (debt, collateral) leg for `borrower` and size the liquidation."""
-    hf = acct["health_factor"]
-    cf = close_factor(acct["total_debt_base"], hf)
-
-    # debt legs: reserves with positive borrow; value in USD*1e8. Prefer a stable (cheap exit).
+    """Pick the best (debt, collateral) leg for `borrower` and size the liquidation. The runner-up
+    collateral leg (same debt) rides along as row['alt'] — the executor falls back to it when the
+    primary collateral has no LiquidSwap route (e.g. exotic Pendle PT)."""
+    # debt legs: reserves with positive borrow; value in USD*1e8.
     debts, colls = [], []
     for a, d in ureserves.items():
         c = cfg.get(a)
@@ -196,23 +206,44 @@ def _build_row(borrower: str, acct: dict, ureserves: dict, cfg: dict, prices: di
         return None
 
     # debt leg: largest value, tie-break to a stable. collateral leg: largest bonus-weighted value.
-    debts.sort(key=lambda x: (is_stable(x[0]), x[2]), reverse=True)
+    debts.sort(key=lambda x: (x[2], is_stable(x[0])), reverse=True)
     colls.sort(key=lambda x: x[2] * x[3], reverse=True)
     d_addr, d_wei, _ = debts[0]
-    c_addr, c_wei, _, bonus = colls[0]
+
+    rows = []
+    for c_addr, c_wei, _, bonus in colls[:2]:
+        row = _size_row(borrower, acct, cfg, prices, d_addr, d_wei, c_addr, c_wei, bonus)
+        if row:
+            rows.append(row)
+    if not rows:
+        return None
+    if len(rows) > 1:
+        rows[0]["alt"] = rows[1]
+    return rows[0]
+
+
+def _size_row(borrower: str, acct: dict, cfg: dict, prices: dict,
+              d_addr: str, d_wei: int, c_addr: str, c_wei: int, bonus: int) -> dict | None:
+    """Size one (debt, collateral) leg into an executor-ready target row."""
+    hf = acct["health_factor"]
     dc, cc = cfg[d_addr], cfg[c_addr]
+    fee = cc.get("liquidation_fee", LIQ_PROTOCOL_FEE_BPS)
 
     sz = size_liquidation(d_wei, dc["decimals"], prices[d_addr],
-                          c_wei, cc["decimals"], prices[c_addr], bonus, cf)
+                          c_wei, cc["decimals"], prices[c_addr], bonus, fee,
+                          acct["total_debt_base"], hf)
     if sz["debt_to_cover"] <= 0 or sz["seized"] <= 0:
         return None
     return {
-        "borrower": borrower, "hf": hf / 1e18, "close_factor": cf,
+        "borrower": borrower, "hf": hf / 1e18, "close_factor": sz["close_factor"],
         "debt_asset": d_addr, "debt_dec": dc["decimals"], "debt_price": prices[d_addr],
         "coll_asset": c_addr, "coll_dec": cc["decimals"], "coll_price": prices[c_addr],
-        "bonus_bps": bonus, "debt_to_cover": sz["debt_to_cover"], "seized": sz["seized"],
+        "bonus_bps": bonus, "fee_bps": fee,
+        "debt_to_cover": sz["debt_to_cover"], "debt_pulled": sz["debt_pulled"],
+        "seized": sz["seized"], "seized_gross": sz["seized_gross"],
         "repaid_usd": sz["repaid_usd"], "seized_usd": sz["seized_usd"],
-        "gross_bonus_usd": sz["gross_bonus_usd"],
+        "net_bonus_usd": sz["net_bonus_usd"],
+        "full_debt_close": sz["full_debt_close"], "full_coll_seize": sz["full_coll_seize"],
         "total_debt_usd": acct["total_debt_base"] / ORACLE_BASE_UNIT,
         "debt_sym": sym(d_addr), "coll_sym": sym(c_addr),
     }
@@ -227,7 +258,7 @@ def run_once(rpc: Rpc | None = None, book_path: str = BOOK_PATH, log_path: str =
     for t in sorted(r["targets"], key=lambda x: x["hf"]):
         lines.append(f"  >>> WOULD LIQUIDATE hf={t['hf']:.4f} cf={t['close_factor']:.0%} "
                      f"{t['coll_sym']}->{t['debt_sym']} cover=${t['repaid_usd']:,.0f} "
-                     f"bonus≈${t['gross_bonus_usd']:,.0f} {t['borrower']}")
+                     f"bonus≈${t['net_bonus_usd']:,.0f} {t['borrower']}")
     for t in sorted(r["risk"], key=lambda x: x["hf"])[:20]:
         lines.append(f"  hf={t['hf']:.4f} debt=${t['total_debt_usd']:,.0f} "
                      f"{t['coll_sym']}->{t['debt_sym']} {t['borrower']}")
