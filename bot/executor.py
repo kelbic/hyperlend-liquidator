@@ -13,6 +13,27 @@ lose the whale-ticket races to the Tokyo-colocated pros. This bot is a cheap opt
 and present to harvest MID-TIER ($10k-$50k) spillover during crash bursts when the pros hit
 capacity. So: don't burn gas racing whales; gate hard on net profit; stay up.
 
+DETECTION LOOP — amortized hot-set (mirrors the katana bot's hot-set pattern, adapted to Aave's
+full-book model; see loop() / _hot_iteration()). The old loop() re-swept getUserAccountData over
+the ENTIRE ~25k-borrower book every pass (1.5-5.5 min, up to 20 min under RPC stress — during which
+the log was SILENT and the 600s deadman false-fired). Instead, each iteration now:
+  a. re-polls the HOT SET (borrowers with HF < HL_HOT_HF) so a cross to HF<1 is caught within ONE
+     iteration (~seconds), running the UNCHANGED evaluate()/fire() economics on any HF<1;
+  b. advances a rolling full-book cursor by HL_SWEEP_CHUNK borrowers to refresh hot-set membership,
+     covering all 25k every ~ceil(N/CHUNK) iterations (~a few min), continuously — NO blocking
+     full sweep, so the log never goes silent;
+  c. emits a compact status line EVERY iteration (this is the root-cause fix for the deadman
+     false-alarm — the deadman itself is unchanged);
+  d. sleeps HL_HOT_POLL_SEC.
+Hot poll + cursor slice are read in ONE bounded multicall over (hot ∪ chunk). Transport is hardened
+(analysis/rpc.py): a short socket timeout PLUS a HARD total wall deadline per attempt (the socket
+timeout is per-recv, not total — a trickling endpoint outlasts it: a 400-call multicall took 33s
+under a 25s socket timeout), and any hung / timed-out / rate-limited endpoint is benched and the
+next tried — so one black-holing node can never wedge the single-threaded loop.
+Residual latency: a position HEALTHIER than HL_HOT_HF that crashes straight under 1 between sweeps
+is caught within one full-book cycle (a few min), not at hot-poll cadence — HL_HOT_HF is sized wide
+(default 1.30) to make that rare, and is env-tunable (widen before an anticipated mega-crash).
+
 Capital protection (defaults are safe — this NEVER sends by default):
   * DRY_RUN=1 by default: logs what it WOULD do, sends nothing. Guard reads "DRY".
   * Off-chain net gate: fires only if quoted net (proceeds - flashRepay - gas) >= HL_MIN_PROFIT.
@@ -46,8 +67,12 @@ sys.path.insert(0, REPO)
 
 from bot import config as C                                    # noqa: E402
 from bot import liqd                                           # noqa: E402
-from analysis.aave import SEL_GET_USER_ACCOUNT_DATA, decode_user_account_data  # noqa: E402
-from analysis.monitor import load_book, save_book, scan  # noqa: E402
+from analysis.aave import (                                    # noqa: E402
+    HF_INFINITY, SEL_GET_USER_ACCOUNT_DATA, decode_user_account_data,
+)
+from analysis.monitor import (                                 # noqa: E402
+    discover_borrowers, load_book, load_reserves, refine, save_book, scan, sweep_accounts,
+)
 from analysis.protocols import ORACLE_BASE_UNIT, is_stable, sym  # noqa: E402
 from analysis.rpc import Rpc                                    # noqa: E402
 
@@ -76,6 +101,74 @@ def _roll_day(st: dict, today: str) -> None:
     if st.get("day") != today:
         st["day"] = today
         st["gas_usd"] = 0.0
+
+
+# --------------------------------------------------------------------------- hot-set + cursor
+# Persisted in the repo data dir (NOT ~/.hyperlend-bot), so a restart resumes mid-book with a warm
+# hot set instead of re-scanning 25k borrowers from zero. `cursor` indexes book["borrowers"] for
+# the rolling full-book sweep; `hot` is the set of borrowers with HF < HOT_HF that we re-poll every
+# iteration.
+def load_hotset() -> dict:
+    if os.path.exists(C.HOTSET_FILE):
+        try:
+            hs = json.load(open(C.HOTSET_FILE))
+            return {"cursor": int(hs.get("cursor", 0)), "hot": list(hs.get("hot", []))}
+        except Exception:
+            pass
+    return {"cursor": 0, "hot": []}
+
+
+def save_hotset(hs: dict) -> None:
+    os.makedirs(os.path.dirname(C.HOTSET_FILE), exist_ok=True)
+    tmp = C.HOTSET_FILE + ".tmp"
+    json.dump({"cursor": hs.get("cursor", 0), "hot": sorted(hs.get("hot", []))}, open(tmp, "w"))
+    os.replace(tmp, C.HOTSET_FILE)
+
+
+def next_chunk(borrowers: list[str], cursor: int, chunk: int) -> tuple[list[str], int, bool]:
+    """Advance the rolling full-book cursor by `chunk`. Returns (slice, new_cursor, wrapped).
+    Wraps to 0 at the end of the book so every borrower is re-swept every ceil(N/chunk) iterations
+    — a borrower can never be permanently dropped. `wrapped` marks the end of a full cycle (when
+    the loop runs discovery + persists the book)."""
+    n = len(borrowers)
+    if n == 0:
+        return [], 0, True
+    cursor %= n
+    end = cursor + chunk
+    sl = borrowers[cursor:end]
+    if end >= n:
+        return sl, 0, True
+    return sl, end, False
+
+
+def targets_from_accounts(accounts: dict, min_debt_usd: float) -> list[str]:
+    """Borrowers just read that are liquidatable NOW: HF < 1 with non-dust debt. Feeds the exact
+    same refine() -> evaluate() -> fire() path the full-book scan used (economics unchanged)."""
+    floor = min_debt_usd * ORACLE_BASE_UNIT
+    return [b for b, a in accounts.items()
+            if a["health_factor"] < int(1e18) and a["total_debt_base"] >= floor]
+
+
+def update_hotset(hot: set[str], accounts: dict, hot_hf: float, min_debt_usd: float,
+                  drop: set[str] = frozenset()) -> set[str]:
+    """Recompute hot-set membership from freshly-read `accounts`:
+      * ADD any borrower read with HF < hot_hf, non-dust debt, and finite HF (has debt),
+      * DROP any hot member read with HF >= hot_hf or infinite HF (recovered / debt repaid),
+      * DROP anything in `drop` (a borrower we just fired — removed until the sweep re-seeds it),
+      * borrowers NOT in `accounts` this iteration KEEP their membership (still watched; they are
+        re-read every iteration because the hot set is always part of the union we sweep).
+    Pure — no I/O — so the transitions are unit-tested directly."""
+    ceil_wei = int(hot_hf * 1e18)
+    floor = min_debt_usd * ORACLE_BASE_UNIT
+    new = set(hot)
+    for b, a in accounts.items():
+        hf, debt = a["health_factor"], a["total_debt_base"]
+        if hf < ceil_wei and hf < HF_INFINITY and debt >= floor:
+            new.add(b)
+        else:
+            new.discard(b)      # read but no longer qualifies -> drop
+    new -= set(drop)
+    return new
 
 
 class GuardTripped(Exception):
@@ -236,6 +329,44 @@ def fire(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -> None:
         alert(f"❌ cast error {hdr}: {e}")
 
 
+# --------------------------------------------------------------------------- target processing
+def process_targets(rpc: Rpc, targets: list, st: dict, now_ts: float, gas_usd: float) -> list[str]:
+    """Run the (unchanged) per-target fire path over `targets`: dedup -> fresh-HF re-check ->
+    evaluate() (with the alt-leg no-route fallback) -> profitability gate -> fire(). Returns the
+    borrowers actually fired this call (so the loop can drop them from the hot set until the
+    rolling sweep re-seeds them). Lifted verbatim out of once() so the full-book scan AND the live
+    hot-set loop share ONE fire path — economics, guards, alerts, RACE/dedup all byte-identical."""
+    fired: list[str] = []
+    for t in sorted(targets, key=lambda x: -(x.get("net_bonus_usd") or 0)):
+        key = t["borrower"]
+        if recently_fired(st, key, now_ts):
+            continue
+        hf_now = fresh_hf(rpc, key)
+        if hf_now is not None and hf_now >= 1.0:
+            print(f"  skip {key[:10]}…: HF cured to {hf_now:.4f} before fire")
+            continue
+        ev = evaluate(t, gas_usd)
+        # no route on the primary collateral (e.g. exotic Pendle PT) -> try the runner-up leg
+        if ev and "skip" in ev and "no LiquidSwap route" in ev["skip"] and t.get("alt"):
+            print(f"  skip {key[:10]}… {t['coll_sym']}->{t['debt_sym']}: {ev['skip']}; "
+                  f"falling back to {t['alt']['coll_sym']}")
+            t = t["alt"]
+            ev = evaluate(t, gas_usd)
+        if ev is None:
+            continue
+        if "skip" in ev:
+            print(f"  skip {key[:10]}… {t['coll_sym']}->{t['debt_sym']}: {ev['skip']}")
+            continue
+        nets = f"${ev['net_usd']:+,.1f}"
+        print(f"  target {key[:10]}… HF={t['hf']:.4f} {t['coll_sym']}->{t['debt_sym']} "
+              f"cover=${t['repaid_usd']:,.0f} net={nets} impact={ev['impact']*100:.2f}% "
+              f"profitable={ev['profitable']}")
+        if ev["profitable"]:
+            fire(t, ev, st, now_ts, gas_usd)
+            fired.append(key)
+    return fired
+
+
 # --------------------------------------------------------------------------- pass / loop
 def once(st: dict | None = None, book: dict | None = None) -> int:
     own = st is None
@@ -269,36 +400,86 @@ def once(st: dict | None = None, book: dict | None = None) -> int:
         raise GuardTripped(reason)
 
     gas_usd = gas_cost_usd(rpc)
-    for t in sorted(targets, key=lambda x: -(x.get("net_bonus_usd") or 0)):
-        key = t["borrower"]
-        if recently_fired(st, key, now_ts):
-            continue
-        hf_now = fresh_hf(rpc, key)
-        if hf_now is not None and hf_now >= 1.0:
-            print(f"  skip {key[:10]}…: HF cured to {hf_now:.4f} before fire")
-            continue
-        ev = evaluate(t, gas_usd)
-        # no route on the primary collateral (e.g. exotic Pendle PT) -> try the runner-up leg
-        if ev and "skip" in ev and "no LiquidSwap route" in ev["skip"] and t.get("alt"):
-            print(f"  skip {key[:10]}… {t['coll_sym']}->{t['debt_sym']}: {ev['skip']}; "
-                  f"falling back to {t['alt']['coll_sym']}")
-            t = t["alt"]
-            ev = evaluate(t, gas_usd)
-        if ev is None:
-            continue
-        if "skip" in ev:
-            print(f"  skip {key[:10]}… {t['coll_sym']}->{t['debt_sym']}: {ev['skip']}")
-            continue
-        nets = f"${ev['net_usd']:+,.1f}"
-        print(f"  target {key[:10]}… HF={t['hf']:.4f} {t['coll_sym']}->{t['debt_sym']} "
-              f"cover=${t['repaid_usd']:,.0f} net={nets} impact={ev['impact']*100:.2f}% "
-              f"profitable={ev['profitable']}")
-        if ev["profitable"]:
-            fire(t, ev, st, now_ts, gas_usd)
+    process_targets(rpc, targets, st, now_ts, gas_usd)
     save_book(book)          # persist the borrower book so it survives restarts
     if own:
         save_state(st)
     return len(targets)
+
+
+# --------------------------------------------------------------------------- amortized hot loop
+def _hot_iteration(rpc: Rpc, book: dict, st: dict, hs: dict, gas_usd: float,
+                   reserves_cfg: dict) -> dict:
+    """ONE amortized loop iteration — the core of the redesign. In a single bounded getUserAccount-
+    Data sweep it reads (hot-set ∪ next rolling cursor chunk), then:
+      a. re-polls every hot-set member (so a cross to HF<1 is caught within ONE iteration),
+      b. advances the full-book cursor by SWEEP_CHUNK (refreshing hot-set membership across the
+         whole 25k book every ~ceil(N/CHUNK) iterations),
+      c. fires any HF<1 through the unchanged refine()->process_targets() path,
+      d. drops fired borrowers from the hot set (re-seeded when the sweep next reaches them).
+    Returns a status dict for the per-iteration log line. Does NOT raise on a tripped guard — it
+    reports guard state so the caller logs the status line FIRST (the log must never go silent),
+    then kills. RPC is bounded (hardened Rpc + multicall retries=1), so no endpoint hang can block
+    this for more than ~a few * hard_timeout seconds — never the multi-minute silence that used to
+    false-fire the deadman."""
+    now_ts = time.time()
+    borrowers = book["borrowers"]
+    hot = set(hs["hot"])
+    chunk, new_cursor, wrapped = next_chunk(borrowers, hs["cursor"], C.SWEEP_CHUNK)
+    to_read = list(dict.fromkeys(list(hot) + chunk))       # hot members re-read EVERY iteration
+    accounts = sweep_accounts(rpc, to_read, retries=1)
+
+    tgt_borrowers = targets_from_accounts(accounts, C.MIN_DEBT_USD)
+    ok, reason = guard_ok(st)
+    fired: list[str] = []
+    if tgt_borrowers and (ok or C.DRY_RUN):
+        # size ONLY the HF<1 borrowers (cheap) via the identical refine() sizing, then the
+        # identical process_targets() fire path — economics/guards/alerts byte-identical.
+        targets, _risk = refine(rpc, book, accounts, tgt_borrowers, reserves_cfg,
+                                min_debt_usd=C.MIN_DEBT_USD, watch_hf=C.HOT_HF, report_hf=C.HOT_HF,
+                                retries=1)
+        fired = process_targets(rpc, targets, st, now_ts, gas_usd)
+
+    hot = update_hotset(hot, accounts, C.HOT_HF, C.MIN_DEBT_USD, drop=set(fired))
+    hs["cursor"] = new_cursor
+    hs["hot"] = sorted(hot)
+
+    hfs = [a["health_factor"] / 1e18 for a in accounts.values() if a["health_factor"] < HF_INFINITY]
+    return {"n_read": len(accounts), "n_hot": len(hot), "n_targets": len(tgt_borrowers),
+            "fired": len(fired), "cursor": new_cursor, "wrapped": wrapped, "chunk": len(chunk),
+            "n_book": len(borrowers), "min_hf": min(hfs) if hfs else None,
+            "guard_ok": ok, "reason": reason}
+
+
+def _run_discovery(rpc: Rpc, book: dict) -> None:
+    """End-of-cycle discovery: merge new Borrow-log borrowers and advance the checkpoint (bounded
+    getLogs, HL_INCR_WINDOW back from head; the hardened rpc caps any endpoint hang). Run once per
+    full-book cycle (cursor wrap) — a brand-new borrower is healthy at borrow time, so a few-minute
+    add latency is harmless, and it keeps getLogs off the hot path."""
+    to = rpc.block_number()
+    book["borrowers"] = sorted(discover_borrowers(rpc, book, to))
+    book["last_block"] = to
+
+
+def _log_iter(status: dict, dt: float) -> None:
+    """The compact status line emitted EVERY iteration — this is what keeps the log ticking so the
+    600s deadman never false-fires (the root-cause fix). Also the operator's live health view."""
+    ts = time.strftime("%H:%M:%S")
+    if "err" in status:
+        print(f"[{ts}] hot-set iteration ERROR ({dt:.1f}s): {status['err']}")
+        return
+    nb = status.get("n_book", 0)
+    cur = status.get("cursor", 0)
+    pct = (100.0 * cur / nb) if nb else 0.0
+    mh = status.get("min_hf")
+    mh_s = f"{mh:.4f}" if mh is not None else "n/a"
+    g = "OK" if status.get("guard_ok") else f"STOP({status.get('reason')})"
+    fired = status.get("fired", 0)
+    fired_s = f" fired {fired}" if fired else ""
+    print(f"[{ts}] hot-set: read {status['n_read']} | hot {status['n_hot']} | "
+          f"tgt {status['n_targets']}{fired_s} | sweep {cur}/{nb} ({pct:.0f}%) | "
+          f"minHF {mh_s} | {dt:.1f}s | guard={g} "
+          f"(DRY_RUN={'on' if C.DRY_RUN else 'OFF'}, contract={'set' if C.CONTRACT else 'none'})")
 
 
 def heartbeat(st: dict) -> None:
@@ -340,6 +521,7 @@ def loop() -> None:
     lock = _acquire_lock()  # noqa: F841 (held for process lifetime)
     st = load_state()
     book = load_book()
+    hs = load_hotset()
     ok, reason = guard_ok(st)
     if not ok and not C.DRY_RUN:
         # kill-switch already tripped: exit quietly with a throttled alert instead of spamming a
@@ -348,10 +530,18 @@ def loop() -> None:
                         f"(python3 -m bot.executor reset, then restart).")
         save_state(st)
         sys.exit(1)
+    # Hardened READ rpc for the loop: short socket timeout + HARD total wall cap per attempt +
+    # endpoint benching, so one black-holing endpoint can NEVER wedge the single-threaded loop
+    # (a 25s socket timeout demonstrably did not stop a 33s multicall stall — see analysis/rpc.py).
+    rpc = Rpc(C.READ_RPCS, timeout=C.RPC_TIMEOUT, retries=C.RPC_RETRIES, min_interval=0.05,
+              backoff_429=0.2, hard_timeout=C.RPC_HARD_TIMEOUT, bench_sec=C.RPC_BENCH_SEC)
+    reserves_cfg = load_reserves(rpc, book)   # cached in book; no RPC if already present
+    save_book(book)
     banner = (f"▶️ hyperlend executor started (DRY_RUN={'on' if C.DRY_RUN else 'OFF'}, "
               f"path={'flash' if C.USE_FLASHLOAN else 'capital'}, min_profit ${C.MIN_PROFIT_USD}, "
-              f"contract={'set' if C.CONTRACT else 'NONE'}, kill-switch gas ${C.MAX_DAILY_GAS_USD}/day, "
-              f"{C.MAX_CONSEC_REVERTS} reverts).")
+              f"contract={'set' if C.CONTRACT else 'NONE'}, hot-set HF<{C.HOT_HF} "
+              f"poll {C.HOT_POLL_SEC}s / sweep {C.SWEEP_CHUNK}/iter of {len(book['borrowers'])}, "
+              f"kill-switch gas ${C.MAX_DAILY_GAS_USD}/day, {C.MAX_CONSEC_REVERTS} reverts).")
     print(banner)
     # throttle repeat start banners too — a crash-loop under the cron watchdog must not spam
     if time.time() - st.get("last_start_alert", 0) > 600:
@@ -360,20 +550,35 @@ def loop() -> None:
         alert(banner)
     st["last_heartbeat"] = time.time()
     while True:
+        t0 = time.monotonic()
+        _roll_day(st, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         try:
-            n = once(st, book)
-            wait = C.HOT_POLL_SEC if n else C.POLL_SEC
-        except GuardTripped as g:
-            _kill_alert(st, f"🛑 KILL-SWITCH: {g}. Executor stopped — needs intervention "
-                            f"(python3 -m bot.executor reset, then restart).")
-            save_state(st)
-            sys.exit(1)   # non-zero: the watchdog must see FAILURE, not a clean exit
+            gas_usd = gas_cost_usd(rpc)
+            status = _hot_iteration(rpc, book, st, hs, gas_usd, reserves_cfg)
         except Exception as e:
-            print(f"loop err: {e}")
-            wait = C.POLL_SEC
+            # a transient read failure must NOT kill the loop or silence the log — it logs a
+            # status line and retries next iteration (the hardened rpc already bounded the wait).
+            status = {"err": str(e)[:180]}
+        st["passes"] += 1
+        # end of a full-book cycle: fold in new borrowers + persist the book
+        if status.get("wrapped"):
+            try:
+                _run_discovery(rpc, book)
+            except Exception as e:
+                print(f"discovery err: {e}")
+            save_book(book)
+        # STATUS LINE — every iteration, BEFORE any kill/exit, so the log never goes silent
+        _log_iter(status, time.monotonic() - t0)
+        if status.get("guard_ok") is False and not C.DRY_RUN:
+            _kill_alert(st, f"🛑 KILL-SWITCH: {status['reason']}. Executor stopped — needs "
+                            f"intervention (python3 -m bot.executor reset, then restart).")
+            save_state(st)
+            save_hotset(hs)
+            sys.exit(1)   # non-zero: the watchdog must see FAILURE, not a clean exit
         heartbeat(st)
         save_state(st)
-        time.sleep(wait)
+        save_hotset(hs)
+        time.sleep(C.HOT_POLL_SEC)
 
 
 def main() -> None:

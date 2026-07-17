@@ -113,59 +113,54 @@ def load_reserves(rpc: Rpc, book: dict) -> dict:
     return out
 
 
-# --- core scan (shared by CLI + executor) --------------------------------------
-def scan(rpc: Rpc | None = None, book: dict | None = None,
-         min_debt_usd: float = MIN_DEBT_USD, watch_hf: float = WATCH_HF,
-         report_hf: float = REPORT_HF) -> dict:
-    """One pass. Returns {block, n_positions, targets:[HF<1 & sized], risk:[HF<report_hf], book}.
-    Each target row carries everything the executor needs to fire: debt/coll assets + decimals,
-    debtToCover (wei, may overshoot on full closes — the Pool clamps), expected received
-    collateral (wei, net of the liquidation protocol fee), prices, HF, close factor."""
-    rpc = rpc or Rpc()
-    book = book if book is not None else load_book()
-    to = rpc.block_number()
-
-    reserves_cfg = load_reserves(rpc, book)
-    reserves = list(reserves_cfg.keys())
-
-    # 1. discovery
-    borrowers = discover_borrowers(rpc, book, to)
-    borrower_list = sorted(borrowers)
-
-    # 2. sweep getUserAccountData for the whole book
+# --- composable read stages (shared by the full-book scan AND the live hot-set loop) -----------
+def sweep_accounts(rpc: Rpc, borrower_list: list[str], retries: int = 4) -> dict:
+    """One Multicall3 getUserAccountData sweep over `borrower_list` -> {borrower: account}. This
+    is THE expensive read. scan() runs it over the whole book; the live executor loop runs it over
+    only (hot-set ∪ rolling cursor chunk), so no single iteration blocks on a full-book sweep."""
     res = multicall(rpc, [(POOL, SEL_GET_USER_ACCOUNT_DATA + b[2:].rjust(64, "0"))
-                          for b in borrower_list])
+                          for b in borrower_list], retries=retries)
     accounts = {}
     for b, (ok, ret) in zip(borrower_list, res):
         if ok and len(ret) >= 2 + 6 * 64:
             accounts[b] = decode_user_account_data(ret)
+    return accounts
 
-    # near-edge set: finite HF under the watch/report ceiling and non-dust debt
+
+def refine(rpc: Rpc, book: dict, accounts: dict, candidates: list[str],
+           reserves_cfg: dict | None = None, min_debt_usd: float = MIN_DEBT_USD,
+           watch_hf: float = WATCH_HF, report_hf: float = REPORT_HF, retries: int = 4):
+    """Given ALREADY-swept `accounts`, size the near-edge subset of `candidates` into executor-
+    ready rows. Returns (targets, risk). This is steps 3-4 of the old scan() lifted out verbatim
+    (bounded reserve-data + price reads -> pure analysis.aave sizing — economics byte-identical),
+    so the live loop can size whatever borrowers it just found near the line without a full sweep."""
+    if reserves_cfg is None:
+        reserves_cfg = {k.lower(): v for k, v in (book.get("configs") or {}).items()}
+    reserves = list(reserves_cfg.keys())
     ceiling = max(watch_hf, report_hf)
-    near = [b for b, a in accounts.items()
-            if a["health_factor"] < int(ceiling * 1e18)
-            and a["total_debt_base"] / ORACLE_BASE_UNIT >= min_debt_usd
-            and a["health_factor"] < HF_INFINITY]
+    near = [b for b in candidates
+            if b in accounts
+            and accounts[b]["health_factor"] < int(ceiling * 1e18)
+            and accounts[b]["total_debt_base"] / ORACLE_BASE_UNIT >= min_debt_usd
+            and accounts[b]["health_factor"] < HF_INFINITY]
 
-    # 3. per-asset reserve data + prices for the near-edge set only (bounded)
     prices, user_reserves = {}, {}
     if near:
         pres = multicall(rpc, [(ORACLE, SEL_GET_ASSET_PRICE + a[2:].rjust(64, "0"))
-                               for a in reserves])
+                               for a in reserves], retries=retries)
         for a, (ok, ret) in zip(reserves, pres):
             if ok and len(ret) >= 66:
                 prices[a] = int(ret[2:66], 16)
         pairs = [(b, a) for b in near for a in reserves]
         rres = multicall(rpc, [(POOL_DATA_PROVIDER,
                                 SEL_GET_USER_RESERVE_DATA + a[2:].rjust(64, "0") + b[2:].rjust(64, "0"))
-                               for b, a in pairs])
+                               for b, a in pairs], retries=retries)
         for (b, a), (ok, ret) in zip(pairs, rres):
             if ok and len(ret) >= 2 + 9 * 64:
                 d = decode_user_reserve_data(ret)
                 if d["variable_debt"] + d["stable_debt"] > 0 or d["aToken_balance"] > 0:
                     user_reserves.setdefault(b, {})[a] = d
 
-    # 4. build target/risk rows
     targets, risk = [], []
     for b in near:
         acct = accounts[b]
@@ -176,6 +171,35 @@ def scan(rpc: Rpc | None = None, book: dict | None = None,
             targets.append(row)
         else:
             risk.append(row)
+    return targets, risk
+
+
+# --- core scan (shared by CLI + executor) --------------------------------------
+def scan(rpc: Rpc | None = None, book: dict | None = None,
+         min_debt_usd: float = MIN_DEBT_USD, watch_hf: float = WATCH_HF,
+         report_hf: float = REPORT_HF) -> dict:
+    """One pass. Returns {block, n_positions, targets:[HF<1 & sized], risk:[HF<report_hf], book}.
+    Each target row carries everything the executor needs to fire: debt/coll assets + decimals,
+    debtToCover (wei, may overshoot on full closes — the Pool clamps), expected received
+    collateral (wei, net of the liquidation protocol fee), prices, HF, close factor.
+
+    NOTE: this is the FULL-BOOK sweep used by the CLI paper mode, bot/validate.py and the `once`
+    diagnostic. The LIVE loop does NOT call it — it uses sweep_accounts()+refine() on a hot set +
+    rolling cursor so it never blocks minutes on 25k borrowers (see bot/executor.py)."""
+    rpc = rpc or Rpc()
+    book = book if book is not None else load_book()
+    to = rpc.block_number()
+
+    reserves_cfg = load_reserves(rpc, book)
+
+    # 1. discovery
+    borrowers = discover_borrowers(rpc, book, to)
+    borrower_list = sorted(borrowers)
+
+    # 2. sweep getUserAccountData for the whole book, then 3-4. size the near-edge subset
+    accounts = sweep_accounts(rpc, borrower_list)
+    targets, risk = refine(rpc, book, accounts, borrower_list, reserves_cfg,
+                           min_debt_usd, watch_hf, report_hf)
 
     # persist book (grows monotonically; configs cached)
     book["last_block"] = to

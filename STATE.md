@@ -28,6 +28,63 @@ Deployed & running:
   debtToCover overshoot clamped to full close, dust revert at <$1000 leftover (passes >$1000),
   uint.max clamped to the 50% close factor.
 
+**2026-07-17 — amortized hot-set detection loop + RPC transport hardening:**
+
+Problem (measured): the loop re-swept `getUserAccountData` over the ENTIRE ~25,486-borrower book
+every pass. Measured full sweep = **293.8s (~4.9 min)** (STATE claimed ~28s); spiked to ~20 min
+under RPC stress, during which the log was SILENT so the 600s deadman false-fired. And it HUNG
+>10 min blocked in a single `do_poll` — a single black-holing endpoint outlasted the 25s socket
+timeout (reproduced live: a 400-call multicall to `rpc.hyperlend.finance` took **33.07s under a
+25s socket timeout** — the socket timeout is per-recv, not total).
+
+Redesign (mirrors the katana hot-set pattern; detection/scheduling only — economics BYTE-IDENTICAL,
+the d0ad2ad/5a50e8c fee/dust/close-factor sizing and the fire path are unchanged, `process_targets`
+was lifted verbatim out of `once()`):
+- **Amortized hot set.** Each `loop()` iteration (`_hot_iteration`) reads `getUserAccountData` for
+  (hot-set ∪ next rolling cursor chunk) in ONE bounded multicall, then (a) re-polls every hot
+  member so a cross to HF<1 is caught within one iteration, (b) advances a full-book cursor by
+  `HL_SWEEP_CHUNK` to refresh membership across all 25k every ~ceil(N/CHUNK) iterations, (c) fires
+  any HF<1 via the unchanged `refine()`→`process_targets()` path, (d) drops fired borrowers from the
+  hot set (re-seeded when the sweep next reaches them). A **compact status line is logged EVERY
+  iteration** — this, not any deadman change, is the root-cause fix for the silence. Cursor + hot
+  set persist to `data/hotset.json` (repo data dir, NOT `~/.hyperlend-bot`) so a restart resumes
+  mid-book with a warm hot set. `analysis/monitor.py` was refactored into `sweep_accounts()` +
+  `refine()`; `scan()` (CLI/`validate`/`once`) still does the full-book sweep and is unchanged.
+- **HF distribution measured (book of 25,486; 7,404 with debt), debt≥$500:** HF<1.0=**0**,
+  <1.15=65, <1.30=**202**, <1.50=377, <2.0=722. Chose **`HL_HOT_HF=1.30`** (202 members, a
+  comfortable "few hundred", polled in ~2s; catches any position within a ~23% burst of the line at
+  hot cadence). Env-tunable — widen toward 1.50 (377) before an anticipated mega-crash.
+- **Transport hardened (`analysis/rpc.py`):** each attempt runs under a HARD total wall deadline
+  (worker thread, independent of the per-recv socket timeout); a hung / timed-out / **rate-limited
+  (`-32005`)** endpoint is benched and the next tried (fixes review M3). `multicall(retries=)` lets
+  the loop pass `retries=1` (the Rpc already rotates), so worst-case per-iteration wall time is
+  bounded (~a few × hard_timeout) even under a total tri-endpoint outage — never the old
+  multi-minute silence. The CLI/backfill path is unchanged (hardening is opt-in via `hard_timeout`).
+- **New knobs (defaults keep behaviour economically identical):** `HL_HOT_HF=1.30`,
+  `HL_HOT_POLL_SEC=2`, `HL_SWEEP_CHUNK=500`, `HL_RPC_TIMEOUT=8`, `HL_RPC_HARD_TIMEOUT=10`,
+  `HL_RPC_RETRIES=3`, `HL_RPC_BENCH_SEC=30`, `HL_HOTSET_FILE`.
+- **Timing estimates.** Hot-set detection latency ≈ HOT_POLL_SEC + iter work ≈ **~2-5s** (a hot
+  member crossing to <1 is fired the same iteration). Full-book cycle = ceil(25486/500)=51 iters ×
+  (~2-4s work + 2s sleep) ≈ **~3-4 min** (residual latency for a healthy→<1 crash-entrant). DRY
+  live validation: per-iteration read = ~500 (not 25k); a 10s endpoint stall was bounded to a 13.6s
+  iteration and rotated, with the status line still printed (never silent). Fast-endpoint 500-call
+  aggregate3 = ~1.8s.
+- **Tests:** full suite green before/after — **35/35** (was 19). Added `analysis/test_rpc.py` (7:
+  rotate-on-timeout, hard-deadline-on-hang, benching, rate-limit rotation, all-dead bounded return,
+  backward-compat) and `bot/test_hotset.py` (9: membership add/drop/fire-removal, cursor
+  wraparound/persistence, the no-gap invariant for a hot member crossing between sweeps, guard
+  behaviour, fire-path-unchanged).
+
+Honest caveats: (1) **crash-entrant residual latency** — a position healthier than HL_HOT_HF that
+crashes straight under 1 is caught within one full-book cycle (~3-4 min), not at hot cadence;
+mitigate by widening HL_HOT_HF before an anticipated event (a volatility-driven auto-widen is a
+noted follow-up, deliberately not built — avoid over-engineering). (2) **RPC load** is comparable
+to slightly lower than before (per iteration ~500-700 account reads vs a 25k sweep; the full book is
+still covered every cycle), and gentler under stress (bench/rotate instead of hammering one node).
+(3) Under a genuine sustained multi-endpoint outage, iterations log "iteration ERROR" and retry —
+degraded but alive and never silent; raise HL_RPC_HARD_TIMEOUT if healthy endpoints legitimately run
+slow. The deadman (`bot/deadman.sh`, 600s) is intentionally left as-is.
+
 _Original build/review notes below (kept for reference)._
 
 This is a cheap-option addition to the 3 live Morpho liquidators. It targets **mid-tier

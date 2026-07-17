@@ -10,6 +10,8 @@ from analysis.protocols import (
 )
 
 CHAIN_ID = 999  # HyperEVM
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(REPO, "data")
 
 # --- RPC ---------------------------------------------------------------------------------------
 # Read endpoint(s): rotated on failure (keep head/logs/reaction spread across these like katana).
@@ -53,8 +55,39 @@ GAS_LIMIT = int(os.environ.get("HL_GAS_LIMIT", "2500000"))
 GAS_UNITS_EST = int(os.environ.get("HL_GAS_UNITS", "1500000"))  # for the gas-USD kill-switch only
 HYPE_USD = float(os.environ.get("HL_HYPE_USD", "45"))           # rough, gas-USD estimate only
 
-POLL_SEC = float(os.environ.get("HL_POLL_SEC", "3"))            # base cadence (calm)
-HOT_POLL_SEC = float(os.environ.get("HL_HOT_POLL_SEC", "1"))    # cadence when near-edge targets exist
+POLL_SEC = float(os.environ.get("HL_POLL_SEC", "3"))            # base cadence (legacy once-loop only)
+# --- amortized hot-set loop (see bot/executor.py loop()) ---------------------------------------
+# The loop no longer blocks on a full-book sweep. Each iteration it (a) re-reads the HF of the
+# HOT SET (borrowers with HF < HOT_HF) so a cross to <1 is caught within one iteration, and (b)
+# advances a rolling full-book cursor by SWEEP_CHUNK borrowers to refresh hot-set membership. A
+# compact status line is logged EVERY iteration, so the log is never silent for more than one
+# cadence — which is what makes the 600s deadman stop false-firing.
+HOT_POLL_SEC = float(os.environ.get("HL_HOT_POLL_SEC", "2"))    # sleep between iterations (~2-3s)
+# HOT_HF: hot-set membership ceiling. Measured HF distribution (debt>=$500, book of ~25.5k, 7404
+# with debt) 2026-07-17: <1.15=65, <1.30=202, <1.50=377, <2.0=722. Default 1.30 keeps the hot
+# set ~200 (a few hundred, polled in ~1.5-2.5s) and catches any position within a ~23% burst of
+# the line at hot-poll cadence. Widen toward 1.50 (377) before an anticipated mega-crash — the
+# cost is a slightly larger hot poll. Positions healthier than HOT_HF that crash in are caught
+# within one full-book cycle (the rolling sweep), a few minutes — the documented residual latency.
+HOT_HF = float(os.environ.get("HL_HOT_HF", "1.30"))
+# SWEEP_CHUNK: borrowers scanned per iteration by the rolling full-book cursor. On the fast
+# official node a 500-call getUserAccountData aggregate3 is ~1.2s; unioned with the hot set the
+# per-iteration read stays ~2 round-trips / a few seconds (< the 8s budget). 25.5k / 500 = ~51
+# iterations, so the full book is re-swept every ~51*(work+HOT_POLL_SEC) ≈ 3-4 min continuously.
+SWEEP_CHUNK = int(os.environ.get("HL_SWEEP_CHUNK", "500"))
+# Cursor + hot-set persist here (repo data dir, NOT ~/.hyperlend-bot) so a restart resumes
+# mid-book with a warm hot set instead of re-scanning from zero.
+HOTSET_FILE = os.environ.get("HL_HOTSET_FILE", os.path.join(DATA_DIR, "hotset.json"))
+
+# --- transport hardening (a single black-holing endpoint must never wedge the single-threaded
+# loop). The stdlib socket `timeout` is per-recv, not total: a trickling/half-open response can
+# block far past it (reproduced live — a 400-call multicall to one endpoint took 33s under a 25s
+# socket timeout). So each RPC attempt also runs under a HARD total wall deadline (worker thread),
+# and any endpoint that times out / hangs / 429s is benched and the next tried. -----------------
+RPC_TIMEOUT = float(os.environ.get("HL_RPC_TIMEOUT", "8"))        # per-attempt socket timeout (s)
+RPC_HARD_TIMEOUT = float(os.environ.get("HL_RPC_HARD_TIMEOUT", "10"))  # hard total wall cap (s)
+RPC_RETRIES = int(os.environ.get("HL_RPC_RETRIES", "3"))         # attempts (~one per endpoint)
+RPC_BENCH_SEC = float(os.environ.get("HL_RPC_BENCH_SEC", "30"))  # bench a failed/hung endpoint
 
 # kill-switch / dedup
 MAX_DAILY_GAS_USD = float(os.environ.get("HL_MAX_DAILY_GAS_USD", "5"))
