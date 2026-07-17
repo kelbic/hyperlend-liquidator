@@ -59,25 +59,29 @@ def decode_aggregate3(result_hex: str) -> list[tuple[bool, str]]:
 
 
 def multicall(rpc, calls: list[tuple[str, str]], chunk: int = 500,
-              gas: int | None = None) -> list[tuple[bool, str]]:
+              gas: int | None = None, retries: int = 4) -> list[tuple[bool, str]]:
     """Batched aggregate3 over an Rpc (eth_call only). Chunked so a single response stays under
     public-endpoint size limits; bounded retries per chunk.
 
     gas defaults to None (omit the eth_call gas cap -> the node picks its default). Some HyperEVM
     endpoints (rpc.hyperliquid.xyz) reject an explicit 50M eth_call gas as "intrinsic gas too high"
-    on small-block state; omitting it works on every reachable endpoint (verified 2026-07-15)."""
+    on small-block state; omitting it works on every reachable endpoint (verified 2026-07-15).
+
+    `retries` is the number of whole-chunk attempts. The live loop passes retries=1 because the
+    Rpc itself already rotates endpoints (and benches a hung one) per attempt — an extra layer here
+    would only multiply the worst-case wall time. The default 4 preserves the CLI/backfill behaviour."""
     import time
 
     out = []
     for i in range(0, len(calls), chunk):
         part = calls[i:i + chunk]
         data = encode_aggregate3(part)
-        for attempt in range(4):
+        for attempt in range(retries):
             try:
                 res = rpc.eth_call(MULTICALL3, data, gas=gas)
                 break
             except Exception:
-                if attempt == 3:
+                if attempt == retries - 1:
                     raise
                 time.sleep(0.4 * (attempt + 1))
         out.extend(decode_aggregate3(res))
