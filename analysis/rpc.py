@@ -228,21 +228,38 @@ class Rpc:
 
 
 def get_logs_chunked(rpc: Rpc, address, topics, from_block: int, to_block: int,
-                     chunk: int = 4_000, on_progress=None) -> list:
-    """getLogs over a big range in fixed windows; halves the window on limit/truncation errors.
-    HyperEVM public endpoints cap getLogs block spans (drpc silently returns [] past ~5k blocks
-    without a UA-scoped error, so keep the default chunk conservative)."""
+                     chunk: int = 4_000, on_progress=None, max_consec_failures: int = 6) -> list:
+    """getLogs over a big range in fixed windows; halves the window on limit/truncation errors
+    (floor 500). HyperEVM public endpoints cap getLogs block spans (drpc silently returns [] past
+    ~5k blocks without a UA-scoped error, so keep the default chunk conservative).
+
+    BOUNDED (fix 2026-07-18): once the halving hit the 500 floor, a persistent error just
+    `continue`d forever — the only raise was reachable at hi==lo, so any window >=2 blocks with
+    every endpoint failing spun the caller infinitely. This became a LIVE path when discovery
+    moved onto every hot-loop cursor wrap (~every few minutes). Now at most `max_consec_failures`
+    CONSECUTIVE failed windows are tolerated (each failure already burned the Rpc client's own
+    bounded retries, so total wall is ~max_consec_failures * retries * hard_timeout worst case);
+    then an RpcError propagates so the caller can skip the pass WITHOUT advancing its checkpoint
+    and retry the same range later. The counter resets on every successful window, so a long
+    (backfill) run with sporadic transient errors still completes."""
     out = []
     lo = from_block
+    failures = 0
     while lo <= to_block:
         hi = min(lo + chunk - 1, to_block)
         try:
             logs = rpc.get_logs(address, topics, lo, hi)
-        except (RpcError, http.client.IncompleteRead, RuntimeError):
-            if hi > lo:
-                chunk = max(500, chunk // 2)
-                continue
-            raise
+        except (RpcError, http.client.IncompleteRead, RuntimeError) as e:
+            failures += 1
+            if failures >= max_consec_failures or hi == lo:
+                if isinstance(e, RpcError):
+                    raise
+                raise RpcError("get_logs_chunked",
+                               f"gave up after {failures} consecutive failed window(s), "
+                               f"last [{lo},{hi}] chunk={chunk}: {e}") from e
+            chunk = max(500, chunk // 2)
+            continue
+        failures = 0
         out.extend(logs)
         if on_progress:
             on_progress(hi, to_block, len(out))

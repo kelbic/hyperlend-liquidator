@@ -168,6 +168,61 @@ def test_hard_timeout_off_by_default_is_backward_compatible():
     assert r.chain_id() == 999
 
 
+# --------------------------------------------------------------------- get_logs_chunked bounded
+class _LogsRpc:
+    """Duck-typed rpc for get_logs_chunked: `fail_pattern(call_no)` -> True raises RpcError."""
+    def __init__(self, fail_pattern):
+        self.calls = 0
+        self.windows = []
+        self._fail = fail_pattern
+
+    def get_logs(self, address, topics, lo, hi):
+        self.calls += 1
+        if self._fail(self.calls):
+            raise rpc_mod.RpcError(-32005, "rate limited")
+        self.windows.append((lo, hi))
+        return [{"lo": lo, "hi": hi}]
+
+
+def test_get_logs_chunked_persistent_failure_raises_bounded():
+    # THE former infinite spin: chunk floor is 500, so on a window >=2 blocks a persistent error
+    # used to `continue` forever (raise only reachable at hi==lo). Now: a bounded number of
+    # consecutive failures -> RpcError up to the caller, quickly.
+    r = _LogsRpc(lambda n: True)                 # every endpoint call fails, forever
+    t0 = time.time()
+    raised = False
+    try:
+        rpc_mod.get_logs_chunked(r, "0xpool", [], 0, 9_999, chunk=4_000)
+    except rpc_mod.RpcError:
+        raised = True
+    assert raised, "persistent getLogs failure must raise, not spin"
+    assert r.calls <= 6, f"gave up only after {r.calls} attempts (must be bounded)"
+    assert time.time() - t0 < 2.0
+
+
+def test_get_logs_chunked_single_block_window_still_raises_fast():
+    # the pre-existing hi==lo escape hatch must survive: a 1-block window raises on first failure
+    r = _LogsRpc(lambda n: True)
+    raised = False
+    try:
+        rpc_mod.get_logs_chunked(r, "0xpool", [], 42, 42, chunk=4_000)
+    except rpc_mod.RpcError:
+        raised = True
+    assert raised and r.calls == 1
+
+
+def test_get_logs_chunked_sporadic_failures_still_complete():
+    # the counter is CONSECUTIVE and resets on success: a long run with a transient error before
+    # every window (6+ total failures, never 2 in a row) must still complete the whole range —
+    # the backfill path must not be aborted by an accumulated count.
+    r = _LogsRpc(lambda n: n % 2 == 1)           # odd calls fail, even succeed
+    logs = rpc_mod.get_logs_chunked(r, "0xpool", [], 0, 3_999, chunk=500)
+    assert len(logs) == 8                        # 8 windows of 500 covering 0..3999
+    assert r.windows[0] == (0, 499) and r.windows[-1] == (3_500, 3_999)
+    covered = sum(hi - lo + 1 for lo, hi in r.windows)
+    assert covered == 4_000, "every block of the range must be swept exactly once"
+
+
 if __name__ == "__main__":
     import sys
     _orig = rpc_mod._urlopen
