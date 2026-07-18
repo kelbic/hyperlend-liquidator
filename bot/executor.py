@@ -57,6 +57,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -216,6 +217,21 @@ def alert(text: str) -> None:
         print(f"alert fail: {e}")
 
 
+def alert_async(text: str) -> None:
+    """Fire-and-forget alert for the FIRE path. alert() is a synchronous HTTPS POST to
+    api.telegram.org — ~0.1-0.5s healthy, and UNBOUNDED against a trickling endpoint (urlopen's
+    timeout=15 is per-recv, not wall — the exact failure mode the RPC transport was hardened
+    against). On a latency-FCFS chain that cost must never sit between the liquidation decision
+    and the broadcast, and a Telegram outage must never delay or fail a shot: post from a daemon
+    thread and move straight on. Any alert failure dies with the throwaway thread."""
+    def _post():
+        try:
+            alert(text)
+        except Exception:
+            pass                    # a failed alert must never matter to the shot
+    threading.Thread(target=_post, daemon=True).start()
+
+
 # --------------------------------------------------------------------------- gas
 def gas_cost_usd(rpc: Rpc) -> float:
     try:
@@ -306,9 +322,13 @@ def fire(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -> None:
             "true" if C.USE_FLASHLOAN else "false", ev["swap_target"], ev["swap_calldata"],
             str(ev["min_profit_wei"]),
             "--gas-limit", str(C.GAS_LIMIT), "--rpc-url", C.RPC_WRITE] + _fee_args() + _sign_args()
-    alert(f"🔫 LIQUIDATE {hdr}, sending…")
     st["fires"] += 1
     st["gas_usd"] += gas_usd
+    # ALL alerts on the fire path are fire-and-forget (alert_async): the old synchronous
+    # pre-broadcast alert made EVERY shot pay a Telegram HTTPS round-trip before `cast send`
+    # (unbounded on a trickling api.telegram.org); the post-result alerts likewise must not delay
+    # the NEXT shot in a multi-target cascade. Broadcast never waits on Telegram.
+    alert_async(f"🔫 LIQUIDATE {hdr}, sending…")
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=90)
         out = (r.stdout or "") + (r.stderr or "")
@@ -318,15 +338,15 @@ def fire(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -> None:
         if reverted:
             st["consec_reverts"] += 1
             st["reverts"] += 1
-            alert(f"❌ revert {hdr}: {out[-200:]}")
+            alert_async(f"❌ revert {hdr}: {out[-200:]}")
         else:
             st["consec_reverts"] = 0
-            alert(f"✅ liq ok {hdr}: {out[-160:]}")
+            alert_async(f"✅ liq ok {hdr}: {out[-160:]}")
     except Exception as e:
         st["consec_reverts"] += 1
         st["reverts"] += 1
         st["sent"][key] = {"ts": now_ts, "status": "revert", "tx": f"err:{e}"}
-        alert(f"❌ cast error {hdr}: {e}")
+        alert_async(f"❌ cast error {hdr}: {e}")
 
 
 # --------------------------------------------------------------------------- target processing
@@ -451,14 +471,27 @@ def _hot_iteration(rpc: Rpc, book: dict, st: dict, hs: dict, gas_usd: float,
             "guard_ok": ok, "reason": reason}
 
 
-def _run_discovery(rpc: Rpc, book: dict) -> None:
+def _run_discovery(rpc: Rpc, book: dict) -> bool:
     """End-of-cycle discovery: merge new Borrow-log borrowers and advance the checkpoint (bounded
     getLogs, HL_INCR_WINDOW back from head; the hardened rpc caps any endpoint hang). Run once per
     full-book cycle (cursor wrap) — a brand-new borrower is healthy at borrow time, so a few-minute
-    add latency is harmless, and it keeps getLogs off the hot path."""
-    to = rpc.block_number()
-    book["borrowers"] = sorted(discover_borrowers(rpc, book, to))
+    add latency is harmless, and it keeps getLogs off the hot path.
+
+    NEVER raises; returns True when the checkpoint advanced. On a persistent getLogs failure
+    (get_logs_chunked now gives up after a bounded number of consecutive failed windows instead of
+    spinning the loop forever) the cycle is SKIPPED with one clear log line: borrowers/last_block
+    stay UNTOUCHED, so the un-scanned range is re-scanned from the same checkpoint on the next
+    cursor wrap (no Borrow event can be silently lost) and the hot loop keeps ticking."""
+    try:
+        to = rpc.block_number()
+        merged = sorted(discover_borrowers(rpc, book, to))
+    except Exception as e:
+        print(f"discovery skipped this cycle (checkpoint block {book.get('last_block')} kept, "
+              f"range retried next wrap): {e}")
+        return False
+    book["borrowers"] = merged
     book["last_block"] = to
+    return True
 
 
 def _log_iter(status: dict, dt: float) -> None:
