@@ -106,3 +106,6 @@ LOCK_FILE = os.path.expanduser(os.environ.get("HL_LOCK", "~/.hyperlend-bot/execu
 # Telegram (optional; same channel-file convention as the reference bots).
 TG_ENV_FILE = os.path.expanduser("~/.claude/channels/telegram/.env")
 TG_CHAT_ID = os.environ.get("HL_CHAT_ID", "265715923")
+# The whole liquidator fleet posts into ONE chat, so every outgoing alert is prefixed with this
+# short tag — without it an alert cannot be attributed to the bot that sent it.
+BOT_TAG = os.environ.get("HL_BOT_TAG", "hyperlend")

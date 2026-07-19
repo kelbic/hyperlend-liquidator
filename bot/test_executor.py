@@ -204,6 +204,53 @@ def test_run_discovery_success_advances_checkpoint():
     assert book["borrowers"] == sorted(["0x" + "a" * 40, "0x" + "b" * 40])
 
 
+# --- fleet bot tag ---------------------------------------------------------------------------
+
+def _capture_alerts(fn, wait_n=0):
+    """Run fn() with the Telegram POST intercepted; return the alert texts that went out."""
+    import tempfile
+    import urllib.parse
+    import urllib.request
+    sent = []
+
+    def fake_urlopen(req, timeout=None):
+        sent.append(urllib.parse.parse_qs(req.data.decode())["text"][0])
+        return None
+
+    o_open, o_env, o_chat = urllib.request.urlopen, C.TG_ENV_FILE, C.TG_CHAT_ID
+    with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
+        f.write("TELEGRAM_BOT_TOKEN=tok\n")
+        env = f.name
+    urllib.request.urlopen, C.TG_ENV_FILE, C.TG_CHAT_ID = fake_urlopen, env, "-100123"
+    try:
+        fn()
+        deadline = time.time() + 3.0          # alert_async posts from a daemon thread
+        while time.time() < deadline and len(sent) < wait_n:
+            time.sleep(0.01)
+    finally:
+        urllib.request.urlopen, C.TG_ENV_FILE, C.TG_CHAT_ID = o_open, o_env, o_chat
+        os.unlink(env)
+    return sent
+
+
+def test_alert_text_carries_bot_tag():
+    """The fleet posts into ONE Telegram chat, so every outgoing alert must name its bot."""
+    sent = _capture_alerts(lambda: E.alert("\U0001f52b LIQUIDATE 0xdead, sending\u2026"), wait_n=1)
+    assert len(sent) == 1, sent
+    assert sent[0].startswith(f"[{C.BOT_TAG}] "), sent[0]
+    assert "LIQUIDATE 0xdead" in sent[0]
+
+
+def test_bot_tag_applied_exactly_once_through_async_wrapper():
+    """alert_async() hands its text straight to alert(), the ONLY tagging point — the fire path
+    must never emit a doubled "[hyperlend] [hyperlend] ..." prefix."""
+    def _go():
+        E.alert_async("liq ok")               # wrapper path (daemon thread)
+        E.alert(f"[{C.BOT_TAG}] liq ok")      # pre-tagged text must not be tagged twice
+    sent = _capture_alerts(_go, wait_n=2)
+    assert sent == [f"[{C.BOT_TAG}] liq ok"] * 2, sent
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

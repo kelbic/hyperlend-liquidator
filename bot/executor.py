@@ -199,7 +199,16 @@ def recently_fired(st: dict, key: str, now_ts: float) -> bool:
 
 
 # --------------------------------------------------------------------------- telegram (optional)
+def _tagged(text: str) -> str:
+    """Prefix an alert with the bot tag. Applied ONLY here, at the single send point, so no
+    caller (nor alert_async, which just hands its text to alert()) can double-tag; idempotent
+    anyway, so an already-tagged text passes through unchanged."""
+    pre = f"[{C.BOT_TAG}]"
+    return text if text.startswith(pre) else f"{pre} {text}"
+
+
 def alert(text: str) -> None:
+    text = _tagged(text)
     if not C.TG_CHAT_ID:
         return
     try:
