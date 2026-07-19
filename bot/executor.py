@@ -478,6 +478,11 @@ def _fee_args() -> list[str]:
     return ["--priority-gas-price", str(int(C.PRIORITY_GWEI * 1e9))]
 
 
+def _sign_args() -> list[str]:
+    """Key on argv — the ONLY form foundry 1.7.1 accepts short of a keystore. See _fire_cast."""
+    return ["--private-key", C.PRIVATE_KEY]
+
+
 def fire(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -> None:
     key = t["borrower"]
     nets = f"${ev['net_usd']:+,.1f}"
@@ -525,14 +530,21 @@ def _fire_cast(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
                key: str, hdr: str) -> None:
     """Fallback path (HL_RAW_TX=0, the current default). Behaviour is deliberately UNCHANGED from
     the long-running production path — including the blocking receipt wait — so flipping the flag
-    is the only variable when this is verified live. The one fix applied here: the private key is
-    passed through the ENVIRONMENT instead of argv. `--private-key` on the command line is visible
-    in `ps` to every local user on the box for the whole life of the subprocess."""
+    is the only variable when this is verified live.
+
+    The key goes back on argv. It was briefly moved to ETH_PRIVATE_KEY to keep it out of `ps` —
+    but foundry 1.7.1 has NO such env binding (`cast send --help` offers ETH_KEYSTORE /
+    ETH_KEYSTORE_ACCOUNT / ETH_PASSWORD only), so cast fell back to "Error accessing local
+    wallet", every fire returned non-zero, and the caller reads non-zero as a REVERT: three
+    fabricated reverts in one cascade trip the kill-switch and exit the process. The leak is real
+    but it is a local-user read; a silently disarmed liquidator is worse. Closing it properly
+    means a keystore (ETH_KEYSTORE + ETH_PASSWORD) — a separate, verified change, and moot once
+    HL_RAW_TX=1 makes this path dead code."""
     args = ["cast", "send", C.CONTRACT, LIQUIDATE_SIG,
             t["coll_asset"], t["debt_asset"], t["borrower"], str(ev["debt_to_cover"]),
             "true" if C.USE_FLASHLOAN else "false", ev["swap_target"], ev["swap_calldata"],
             str(ev["min_profit_wei"]),
-            "--gas-limit", str(C.GAS_LIMIT), "--rpc-url", C.RPC_WRITE] + _fee_args()
+            "--gas-limit", str(C.GAS_LIMIT), "--rpc-url", C.RPC_WRITE] + _fee_args() + _sign_args()
     st["fires"] += 1
     st["gas_usd"] += gas_usd
     # ALL alerts on the fire path are fire-and-forget (alert_async): the old synchronous
@@ -541,8 +553,7 @@ def _fire_cast(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
     # the NEXT shot in a multi-target cascade. Broadcast never waits on Telegram.
     alert_async(f"🔫 LIQUIDATE {hdr}, sending…")
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=90,
-                           env=dict(os.environ, ETH_PRIVATE_KEY=C.PRIVATE_KEY))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=90)
         out = (r.stdout or "") + (r.stderr or "")
         reverted = (r.returncode != 0) or ("status" in out and "0 (failed)" in out)
         status = "revert" if reverted else "ok"

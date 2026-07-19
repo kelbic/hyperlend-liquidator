@@ -665,9 +665,18 @@ def test_pending_target_is_not_refired_before_it_settles():
 
 
 # ------------------------------------------------------------------- cast fallback: key hygiene
-def test_cast_fallback_passes_the_key_via_env_not_argv():
-    """`--private-key` in argv is readable in `ps` by every local user for the life of the
-    subprocess. The key now travels in the environment instead."""
+def test_cast_fallback_signs_via_argv_because_foundry_has_no_key_env():
+    """REGRESSION GUARD for a self-inflicted outage.
+
+    The key was briefly moved to ETH_PRIVATE_KEY to keep it out of `ps`. foundry 1.7.1 has no
+    such binding (only ETH_KEYSTORE / ETH_KEYSTORE_ACCOUNT / ETH_PASSWORD), so cast could not
+    sign: every fire exited non-zero, _fire_cast reads non-zero as REVERT, and three of those in
+    one cascade trip the kill-switch and exit the process — a silently disarmed liquidator.
+
+    So the key is on argv deliberately. The `ps` leak is a local-user read and is accepted until
+    either a keystore lands or HL_RAW_TX=1 makes this path dead code. This test exists so nobody
+    "fixes" the leak the same broken way twice: if you move the key off argv, you MUST prove cast
+    can still sign (see the live canary, not a mock)."""
     seen = {}
 
     def fake_run(args, **kw):
@@ -681,10 +690,11 @@ def test_cast_fallback_passes_the_key_via_env_not_argv():
         st = _live_fire(lambda text: None, fake_run)
     finally:
         C.RAW_TX = o_raw
-    assert "--private-key" not in seen["args"], seen["args"]
     key = "0x" + "2" * 64
-    assert key not in seen["args"], "the key must not appear anywhere in argv"
-    assert seen["env"] and seen["env"].get("ETH_PRIVATE_KEY") == key
+    assert "--private-key" in seen["args"], seen["args"]
+    assert seen["args"][seen["args"].index("--private-key") + 1] == key
+    # and NOT via the env binding cast does not have — that is what broke it
+    assert not (seen["env"] or {}).get("ETH_PRIVATE_KEY")
     assert st["sent"][_T["borrower"]]["status"] == "ok"
 
 
