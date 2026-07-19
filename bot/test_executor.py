@@ -19,6 +19,7 @@ import os
 import sys
 import threading
 import time
+import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -227,6 +228,11 @@ def _capture_alerts(fn, wait_n=0):
         f.write("TELEGRAM_BOT_TOKEN=tok\n")
         env = f.name
     urllib.request.urlopen, C.TG_ENV_FILE, C.TG_CHAT_ID = fake_urlopen, env, "-100123"
+    # Opt back in past _tg_muted(): the transport above is a FAKE, and these tests exist to check
+    # the alert text itself. Scoped to this helper and restored in finally — every other test in
+    # the suite stays muted by default, which is the point of the guard.
+    o_mute = os.environ.get("HL_MUTE_TG")
+    os.environ["HL_MUTE_TG"] = "0"
     try:
         fn()
         deadline = time.time() + 3.0          # alert_async posts from a daemon thread
@@ -234,6 +240,10 @@ def _capture_alerts(fn, wait_n=0):
             time.sleep(0.01)
     finally:
         urllib.request.urlopen, C.TG_ENV_FILE, C.TG_CHAT_ID = o_open, o_env, o_chat
+        if o_mute is None:
+            os.environ.pop("HL_MUTE_TG", None)
+        else:
+            os.environ["HL_MUTE_TG"] = o_mute
         os.unlink(env)
     return sent
 
@@ -244,6 +254,60 @@ def test_alert_text_carries_bot_tag():
     assert len(sent) == 1, sent
     assert sent[0].startswith(f"[{C.BOT_TAG}] "), sent[0]
     assert "LIQUIDATE 0xdead" in sent[0]
+
+
+def test_a_test_run_can_never_reach_the_real_chat():
+    """THE 19.07 INCIDENT: a test run posted fixtures into the operator's live Telegram —
+    borrower `0xabababab…`, tx `0xffff…ffff`, and the literal string 'not-an-address'.
+
+    The transport must refuse while any test module of this repo is loaded, WITHOUT the test
+    having to remember a stub. This is the last line of defence: if it goes red, some test is
+    one forgotten stub away from spamming a human."""
+    hit = []
+
+    def exploding_urlopen(req, timeout=None):
+        hit.append(req)
+        raise AssertionError("a test reached the REAL Telegram transport")
+
+    o_open, o_env, o_chat = urllib.request.urlopen, C.TG_ENV_FILE, C.TG_CHAT_ID
+    o_mute = os.environ.pop("HL_MUTE_TG", None)          # rely on auto-detect, not the env
+    urllib.request.urlopen, C.TG_CHAT_ID = exploding_urlopen, "-100123"
+    try:
+        E.alert("\U0001f52b LIQUIDATE HF=0.9500 0xabababab…, sent: 0x" + "f" * 64)
+        E.alert_async("⚠️ send error … Got: 'not-an-address'")
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not hit:
+            time.sleep(0.01)
+    finally:
+        urllib.request.urlopen, C.TG_ENV_FILE, C.TG_CHAT_ID = o_open, o_env, o_chat
+        if o_mute is not None:
+            os.environ["HL_MUTE_TG"] = o_mute
+    assert not hit, "the mute guard let a test message through to Telegram"
+
+
+def test_mute_guard_does_not_gag_production():
+    """The guard must not become an outage: with no test module loaded and no override, alerts
+    still go out. Simulated by asking _tg_muted() with the detection inputs cleared."""
+    o_mute = os.environ.pop("HL_MUTE_TG", None)
+    o_mods = {m: sys.modules[m] for m in list(sys.modules)
+              if m.startswith(("bot.test_", "analysis.test_"))}
+    for m in o_mods:
+        del sys.modules[m]
+    main = sys.modules.get("__main__")                 # the runner itself is a test_*.py file;
+    o_file = getattr(main, "__file__", None)           # clear BOTH detection inputs
+    if main is not None:
+        main.__file__ = "/opt/bot/executor.py"
+    try:
+        assert E._tg_muted() is False, "production would be silenced"
+    finally:
+        sys.modules.update(o_mods)
+        if main is not None:
+            if o_file is None:
+                del main.__file__
+            else:
+                main.__file__ = o_file
+        if o_mute is not None:
+            os.environ["HL_MUTE_TG"] = o_mute
 
 
 def test_bot_tag_applied_exactly_once_through_async_wrapper():

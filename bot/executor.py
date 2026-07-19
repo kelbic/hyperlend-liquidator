@@ -240,8 +240,40 @@ def _tagged(text: str) -> str:
     return text if text.startswith(pre) else f"{pre} {text}"
 
 
+def _tg_muted() -> bool:
+    """True when the Telegram transport must stay shut.
+
+    19.07: a test run posted FIXTURES into the operator's live chat — borrower `0xabababab…`,
+    tx hash `0xffff…ffff`, and the literal string 'not-an-address'. The suites exercise fire()
+    and _check_pending, both of which alert; the previous defence was a stub passed by each
+    test, so the first test that forgot one reached the real chat.
+
+    A stub per test cannot hold that line — the guard belongs at the transport, where forgetting
+    is impossible. Default is SAFE: if any test module of this repo is loaded, the transport is
+    off unless a caller explicitly opts back in.
+
+    HL_MUTE_TG: "1" = always mute, "0" = explicit opt-in (only _capture_alerts, which has already
+    replaced urlopen with a fake — it verifies the alert TEXT and must still reach the transport),
+    unset = auto-detect. The opt-in is deliberately awkward to reach by accident."""
+    forced = os.environ.get("HL_MUTE_TG")
+    if forced == "1":
+        return True
+    if forced == "0":
+        return False
+    # `python3 -m bot.test_executor` loads the suite as __main__, NOT under its dotted name — a
+    # sys.modules scan alone MISSES the repo's own runner, which is exactly how the fixtures got
+    # out. Check both: the entry point's filename, and imported test modules (pytest-style).
+    main_file = os.path.basename(getattr(sys.modules.get("__main__"), "__file__", "") or "")
+    if main_file.startswith("test_"):
+        return True
+    return any(m.startswith(("bot.test_", "analysis.test_")) for m in sys.modules)
+
+
 def alert(text: str) -> None:
     text = _tagged(text)
+    if _tg_muted():
+        print(f"[tg muted] {text}")
+        return
     if not C.TG_CHAT_ID:
         return
     try:
