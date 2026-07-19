@@ -16,9 +16,11 @@ WRITE PATH — two implementations behind HL_RAW_TX (see the "raw-tx write path"
     key now travels in the environment rather than argv.
 WHY: `cast send` blocks until the receipt lands — MEASURED 4.4s on 2026-07-19. On a latency-FCFS
 chain the second target of a cascade idled for the first target's entire confirmation. Since a
-send can no longer be judged at fire time, the fleet rule is explicit: an error BEFORE the
-broadcast (transport/signing) is a send_error — it burns no gas and does NOT feed the kill-switch;
-ONLY receipt.status == 0 is a revert.
+send can no longer be judged at fire time, the fleet rule is explicit: ONLY receipt.status == 0 is
+a revert. A failure at fire time is a send_error — it does NOT feed the kill-switch — but ONLY
+when non-delivery is PROVEN (signing/encoding failed, or the node returned an explicit in-body
+verdict). A transport failure proves nothing: the tx is filed as pending on its locally computed
+hash so a receipt can still settle it (see _sign_and_send / SendAmbiguous).
 
 Thesis (do not re-derive): HyperEVM is latency-FCFS with NO priority-fee auction — priority fee
 is non-operative, so we cannot outbid, only out-speed, and from Vienna/US infra we structurally
@@ -349,8 +351,21 @@ def evaluate(t: dict, gas_usd: float) -> dict | None:
 # goes through this separate minimal client against C.RPC_WRITE (mirrors the midnight bot).
 # Receipts are READS and go through the hardened, rotating Rpc.
 
-_nonce_cache: dict = {"addr": None, "next": None}   # local counter layered over 'pending'
+# Local counter layered over the node's 'pending'. `send_ts` is the monotonic clock of the last
+# BROADCAST (see _pending_nonce): the local bump is only trusted while a send is recent.
+NONCE_SEND_WINDOW_SEC = 120.0
+_nonce_cache: dict = {"addr": None, "next": None, "send_ts": 0.0}
 _owner_addr: str | None = None
+
+
+class RpcVerdict(RuntimeError):
+    """An in-body JSON-RPC error: the node RECEIVED the request and answered with a refusal.
+
+    The distinction matters ONLY on the write path, and only for eth_sendRawTransaction: a verdict
+    proves the tx was rejected and is NOT in any mempool, whereas a transport failure (hard
+    deadline, reset socket, half-read response) proves nothing at all — the node may well have
+    accepted the tx and simply failed to tell us. Subclasses RuntimeError so every existing
+    `except RuntimeError` / `except Exception` site behaves exactly as before."""
 
 
 def owner_address() -> str | None:
@@ -386,26 +401,49 @@ def _rpc_write(method: str, params: list, budget: float | None = None):
 
     d = _run_with_deadline(_attempt, wall)
     if d.get("error"):
-        raise RuntimeError(f"rpc {method}: {d['error']}")
+        raise RpcVerdict(f"rpc {method}: {d['error']}")
     return d["result"]
 
 
 def _pending_nonce(addr: str) -> int:
     """nonce = eth_getTransactionCount(addr,'pending') with a local counter layered on top: in a
     multi-target cascade the node's 'pending' does not yet reflect the tx we broadcast seconds ago,
-    so take max(pending, local next). The local counter advances ONLY after a SUCCESSFUL broadcast
-    (_nonce_after_send) — a send that failed must not leave a hole that stalls the whole queue."""
+    so take max(pending, local next) — but ONLY while that send is recent.
+
+    The window is the whole point (lesson bought by wc-liquidator d757345). The local counter used
+    to be monotonic: once it was ahead of the chain it stayed ahead FOREVER. A tx evicted from the
+    mempool (replaced, underpriced, dropped on a node restart) sends the node's 'pending' back to
+    N while we keep signing N+1 — every later shot lands past a hole the sequencer will never
+    fill, so nothing mines again until the process is restarted. That is a silently disarmed
+    liquidator, the worst failure mode this repo has.
+
+    So: inside NONCE_SEND_WINDOW_SEC of a real broadcast, a local bump beats a lagging endpoint's
+    count (the cascade case this cache exists for). Outside it the CHAIN WINS even though it is
+    lower, and the stale bump is dropped — the bot heals itself within ~2 min. `send_ts` is
+    stamped by _nonce_after_send and NOWHERE else: WC's follow-up bug was a prewarm path that also
+    refreshed the timestamp, which kept re-blessing the dead bump and muted the self-heal
+    permanently. Nothing here may refresh send_ts without an actual send."""
     pend = int(_rpc_write("eth_getTransactionCount", [addr, "pending"]), 16)
     nxt = _nonce_cache["next"]
-    if _nonce_cache["addr"] == addr and nxt is not None and nxt > pend:
-        return nxt
+    if _nonce_cache["addr"] != addr or nxt is None or nxt <= pend:
+        return pend
+    if time.monotonic() - _nonce_cache.get("send_ts", 0.0) <= NONCE_SEND_WINDOW_SEC:
+        return nxt                      # still-propagating send: don't reuse its nonce
+    print(f"  nonce resync down: dropping stale local bump {nxt} -> chain {pend} "
+          f"(no send for {time.monotonic() - _nonce_cache.get('send_ts', 0.0):.0f}s)")
+    _nonce_cache["next"] = pend
     return pend
 
 
 def _nonce_after_send(addr: str, used: int) -> None:
-    """Advance the local counter past the nonce we just successfully broadcast."""
+    """Advance the local counter past the nonce we just broadcast — on success AND on an ambiguous
+    outcome (see _sign_and_send): a tx that MAY be in the mempool must not have its nonce reused,
+    or the two txs race and one is guaranteed to be wasted gas. The bump is self-correcting: if
+    the tx really never landed, _pending_nonce drops it back to the chain value once the send
+    window expires. This is the ONLY writer of send_ts."""
     _nonce_cache["addr"] = addr
     _nonce_cache["next"] = used + 1
+    _nonce_cache["send_ts"] = time.monotonic()
 
 
 def _fee_params() -> tuple[int, int]:
@@ -448,9 +486,52 @@ def _encode_liquidate(t: dict, ev: dict) -> str:
     return LIQUIDATE_SELECTOR + abi_encode(LIQUIDATE_TYPES, values).hex()
 
 
+class SendAmbiguous(RuntimeError):
+    """The broadcast outcome is UNKNOWN: the request went out and the answer never came back.
+
+    Carries `tx_hash` — the hash of the signed payload, which is known BEFORE the wire and is
+    exactly the hash the tx would have if the node did accept it. The caller must file this as
+    pending on that hash (see _fire_raw): it is the only way an ambiguous send can still be
+    settled by a receipt instead of vanishing."""
+
+    def __init__(self, tx_hash: str, cause: str):
+        super().__init__(cause)
+        self.tx_hash = tx_hash
+        self.cause = cause
+
+
+class SendUndelivered(RuntimeError):
+    """The node refused the tx with an explicit verdict — it is in NO mempool and burns no gas."""
+
+
+# A node that answers "already known" / "known transaction" is telling us the tx IS in its pool:
+# that is a DELIVERED send whose ack we merely duplicated, not a rejection.
+_ALREADY_IN_POOL = ("already known", "known transaction", "already in the pool")
+
+
+def _signed_tx_hash(signed) -> str:
+    """0x-hash of a signed payload, computed locally — available BEFORE the broadcast."""
+    h = signed.hash
+    return h.to_0x_hex() if hasattr(h, "to_0x_hex") else "0x" + bytes(h).hex()
+
+
 def _sign_and_send(calldata: str) -> str:
-    """Sign an EIP-1559 tx locally and broadcast it. Returns the tx hash; raises on any transport
-    or signing failure (which the caller must classify as a SEND ERROR, never a revert).
+    """Sign an EIP-1559 tx locally and broadcast it. Returns the tx hash.
+
+    THREE outcomes, and conflating the last two loses real money:
+      * accepted -> return the hash;
+      * SendUndelivered -> the node gave an in-body JSON-RPC VERDICT (RpcVerdict: nonce too low,
+        invalid sender, underpriced, ...). The tx reached the node and was refused, so it is in no
+        mempool, burns no gas, and can never produce a receipt. Nothing to track;
+      * SendAmbiguous -> ANY transport failure (hard wall deadline, reset socket, truncated
+        response). This says NOTHING about delivery: a single-endpoint POST that trips our 10s
+        wall may well have been accepted by a node that was merely slow to answer. Treating it as
+        a non-send is how a live tx goes untracked — its gas escapes the daily cap, a revert never
+        reaches consec_reverts, and DEDUP_SEC frees the borrower in 60s for a SECOND liquidation
+        of a position the first tx already cured. So the hash is computed before the wire and the
+        caller files it as pending.
+    The local nonce advances for BOTH accepted and ambiguous (a maybe-sent tx owns its nonce);
+    only a verdict leaves it untouched, since a verdict guarantees no hole.
 
     `to` is CHECKSUMMED explicitly: eth_account will happily sign a lowercase `to`, but a
     mixed-case non-checksummed one raises — and this exact class of bug killed a WC shot. Doing it
@@ -467,8 +548,19 @@ def _sign_and_send(calldata: str) -> str:
     signed = Account.sign_transaction(tx, C.PRIVATE_KEY)
     raw = signed.raw_transaction
     raw_hex = raw.to_0x_hex() if hasattr(raw, "to_0x_hex") else "0x" + raw.hex()
-    txh = _rpc_write("eth_sendRawTransaction", [raw_hex])
-    _nonce_after_send(addr, nonce)     # ONLY after the node accepted it — no hole on failure
+    local_hash = _signed_tx_hash(signed)      # known BEFORE the wire — survives an ambiguous send
+    try:
+        txh = _rpc_write("eth_sendRawTransaction", [raw_hex])
+    except RpcVerdict as e:
+        if any(m in str(e).lower() for m in _ALREADY_IN_POOL):
+            _nonce_after_send(addr, nonce)    # the node HAS it: delivered, just re-acked
+            return local_hash
+        raise SendUndelivered(str(e)) from e   # refused: no mempool entry, no gas, no receipt
+    except Exception as e:
+        # transport-level: delivery unknown. Own the nonce and hand the caller the hash to track.
+        _nonce_after_send(addr, nonce)
+        raise SendAmbiguous(local_hash, str(e)) from e
+    _nonce_after_send(addr, nonce)
     return txh
 
 
@@ -504,26 +596,39 @@ def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
     """HL_RAW_TX=1: encode -> sign -> broadcast -> RETURN. No receipt wait, ever. The tx is filed
     as "pending" and settled by _check_pending() on a later pass, so the next target in a cascade
     is evaluated immediately instead of ~4.4s later."""
+    maybe = ""
     try:
         calldata = _encode_liquidate(t, ev)
         txh = _sign_and_send(calldata)
+    except SendAmbiguous as e:
+        # DELIVERY UNKNOWN — book it exactly like a successful send. A tx we cannot rule out is
+        # live must be tracked: untracked, its gas escapes the daily cap, a revert never reaches
+        # consec_reverts, and the borrower is freed by DEDUP_SEC (60s) long before anyone could
+        # notice — a second liquidation of a position the first tx may already have cured. The
+        # hash was computed from the signed payload, so a receipt still settles this record; if
+        # the tx truly never landed, _check_pending's stale wall releases it after 600s.
+        txh, maybe = e.tx_hash, " (delivery UNCONFIRMED)"
+        print(f"  ambiguous broadcast {txh[:14]}…: {e.cause}; tracking as pending")
     except Exception as e:
-        # SEND ERROR (transport / signing / node rejection BEFORE inclusion) is NOT a revert:
-        # nothing executed on-chain, no gas was burned, and feeding it to consec_reverts would let
-        # an RPC brownout trip the kill-switch and take the bot down for the whole crash window.
-        # Only receipt.status == 0 is a revert (see _check_pending).
+        # SEND ERROR — signing/encoding failed, or the node returned an explicit VERDICT
+        # (SendUndelivered): nothing executed on-chain and nothing can. NOT a revert — feeding it
+        # to consec_reverts would let an RPC brownout trip the kill-switch and take the bot down
+        # for the whole crash window. Only receipt.status == 0 is a revert (see _check_pending).
         st["sent"][key] = {"ts": now_ts, "status": "send_error", "tx": f"senderr:{e}"[:120]}
         alert_async(f"⚠️ send error {hdr} (not counted as revert): {e}")
         return
     st["fires"] += 1
     # Provisional gas charge, exactly ONCE per tx. _check_pending reverses this figure and books
     # the real gasUsed*effectiveGasPrice when the receipt lands, so the daily cap can never be
-    # double-charged for one shot. `gas_usd` is carried on the record to make the undo exact.
+    # double-charged for one shot. `gas_usd` is carried on the record to make the undo exact, and
+    # `gas_day` records WHICH day was charged so a settle after the UTC roll cannot refund a
+    # charge into the fresh day's budget (see _settle_gas).
     st["gas_usd"] += gas_usd
-    st["sent"][key] = {"ts": now_ts, "status": "pending", "tx": txh, "gas_usd": gas_usd}
+    st["sent"][key] = {"ts": now_ts, "status": "pending", "tx": txh, "gas_usd": gas_usd,
+                       "gas_day": st.get("day")}
     # Alert AFTER the broadcast and fire-and-forget: Telegram must never sit between the
     # liquidation decision and the wire, nor delay the next shot in a cascade.
-    alert_async(f"🔫 LIQUIDATE {hdr}, sent: {txh}")
+    alert_async(f"🔫 LIQUIDATE {hdr}, sent: {txh}{maybe}")
 
 
 def _fire_cast(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
@@ -574,15 +679,31 @@ def _fire_cast(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
 
 # --------------------------------------------------------------------------- receipt reaping
 PENDING_STALE_SEC = 600.0     # unmined this long -> flag a possible stuck nonce
+STALE_POLL_SEC = 60.0         # a stale tx is still reaped, but at a slow cadence (see below)
 _SENT_RETENTION_SEC = 86400.0
+
+
+def _rcpt_int(v) -> int:
+    """Parse a receipt integer field. The JSON-RPC spec says quantities are hex strings, but
+    normalizing proxies and some load balancers hand back a plain JSON int — accept both. Raises
+    on anything else (None, "junk"), which is what the callers key their fallbacks off."""
+    if isinstance(v, bool):
+        raise TypeError("bool is not a receipt quantity")
+    if isinstance(v, int):
+        return v
+    return int(v, 16)
 
 
 def _rcpt_status(rcpt: dict) -> int | None:
     """Receipt status, or None when unparsable (status:null and friends). Returning None instead
     of raising is deliberate: a TypeError here would escape into the hot loop and kill the pass —
-    the silent-zombie failure mode (heartbeat alive, detection dead)."""
+    the silent-zombie failure mode (heartbeat alive, detection dead).
+
+    An INTEGER status (status: 1) is a perfectly good answer, not garbage: read as unparsable it
+    left every tx pending forever, so a win was never booked and the borrower stayed blocked until
+    the stale wall — the bot going quiet against a node that did nothing wrong."""
     try:
-        return int(rcpt.get("status"), 16)
+        return _rcpt_int(rcpt.get("status"))
     except (TypeError, ValueError):
         return None
 
@@ -590,14 +711,28 @@ def _rcpt_status(rcpt: dict) -> int | None:
 def _settle_gas(st: dict, rec: dict, rcpt: dict) -> float:
     """Swap the provisional gas charge for the ACTUAL cost of this tx. Runs exactly once per tx,
     at the moment the receipt is decided — so a tx is never charged twice, and never charged at
-    an estimate when the real number is available."""
-    st["gas_usd"] -= rec.get("gas_usd", 0.0)          # undo the provisional charge
+    an estimate when the real number is available.
+
+    The undo is scoped to the DAY the charge was made. _roll_day zeroes gas_usd at the UTC
+    boundary; an unconditional refund afterwards subtracts yesterday's estimate from today's fresh
+    counter and drives it NEGATIVE — measured at -$4.94 with 8 in-flight shots at $0.62, i.e. the
+    $5 cap silently became a ~$10 cap on exactly the day after a busy one. A charge belonging to a
+    closed day is left alone: that day's budget already absorbed it and cannot be re-opened.
+    gas_usd is also clamped at zero, so no other refund path can ever buy extra budget either.
+
+    effectiveGasPrice has NO silent default. `.get(field, "0x0")` turned a receipt that omits it
+    into a $0.00 shot — the daily cap goes blind while real gas burns — where the same missing
+    field on gasUsed correctly fell back to the estimate. Missing means unknown, not free."""
     try:
-        actual = (int(rcpt["gasUsed"], 16) * int(rcpt.get("effectiveGasPrice", "0x0"), 16)
+        actual = (_rcpt_int(rcpt["gasUsed"]) * _rcpt_int(rcpt["effectiveGasPrice"])
                   / 1e18 * C.HYPE_USD)
     except Exception:
         actual = rec.get("gas_usd", 0.0)              # unreadable receipt: keep the estimate
-    st["gas_usd"] += actual
+    if "gas_day" in rec and rec["gas_day"] != st.get("day"):
+        print(f"  gas settle ${actual:.4f} on a tx charged {rec['gas_day']} (today "
+              f"{st.get('day')}): day closed, leaving today's counter untouched")
+        return actual
+    st["gas_usd"] = max(0.0, st["gas_usd"] - rec.get("gas_usd", 0.0)) + actual
     return actual
 
 
@@ -608,23 +743,45 @@ def _check_pending(rpc: Rpc, st: dict, now_ts: float) -> None:
 
     Records are grouped by tx hash so the gas accounting and the revert counters run once per TX,
     not once per key. Each tx settles inside its own try/except: one malformed answer from one
-    endpoint must never take down the pass (this loop is the bot's only liveness)."""
+    endpoint must never take down the pass (this loop is the bot's only liveness).
+
+    TWO ordering rules earn their keep here:
+      1. THE STALE WALL IS APPLIED BEFORE THE READ, never inside a "cleanly not mined" branch. It
+         used to live under `if not rcpt:`, reachable only when an endpoint answered properly — so
+         while the read kept THROWING (the exact situation in which a tx is most likely stuck) the
+         record stayed "pending", and recently_fired() blocks a pending target regardless of age.
+         One dead endpoint therefore locked a borrower out of the fire path until the 24h purge.
+      2. STALE RECORDS ARE STILL REAPED. "stale" means unmined for 10 min, NOT decided: HyperEVM
+         can mine such a tx later. Dropping it from the poll (the previous behaviour) meant its
+         provisional gas was never reconciled against the real receipt and a late revert never
+         reached consec_reverts, while the borrower had already been released — so the kill-switch
+         could not see the very failure pattern it exists to stop. They keep being polled until
+         the 24h retention purge; the alert fires once, on the transition."""
     by_tx: dict[str, list[str]] = {}
     for key, rec in st.get("sent", {}).items():
-        if rec.get("status") == "pending" and str(rec.get("tx", "")).startswith("0x"):
+        if rec.get("status") in ("pending", "stale") and str(rec.get("tx", "")).startswith("0x"):
             by_tx.setdefault(rec["tx"], []).append(key)
     for txh, keys in by_tx.items():
+        rec = st["sent"][keys[0]]
+        # Age check FIRST — outside the try, so it also fires when the read below keeps throwing.
+        # Past the wall it is very likely a stuck nonce (a gap left by an earlier tx the sequencer
+        # never saw) — surface it, the operator must look, and unblock the borrower.
+        if rec.get("status") == "pending" and now_ts - rec.get("ts", 0) > PENDING_STALE_SEC:
+            for k in keys:
+                st["sent"][k]["status"] = "stale"
+            alert_async(f"⚠️ tx unmined 10min (stuck nonce?): {txh}")
+        # A stale tx is polled at STALE_POLL_SEC, not every iteration: it stays in the journal for
+        # 24h, and at hot-loop cadence that would be tens of thousands of receipt reads for one
+        # stuck tx. A PENDING tx keeps polling every pass — its verdict gates the kill-switch
+        # before the next shot, so that latency is the point.
+        if rec.get("status") == "stale" and now_ts - rec.get("last_poll", 0) < STALE_POLL_SEC:
+            continue
+        for k in keys:
+            st["sent"][k]["last_poll"] = now_ts
         try:
-            rec = st["sent"][keys[0]]
             rcpt = rpc.call("eth_getTransactionReceipt", [txh])
             if not rcpt:
-                # not mined yet. Past the stale wall it is very likely a stuck nonce (a gap left
-                # by an earlier tx the sequencer never saw) — surface it, the operator must look.
-                if now_ts - rec["ts"] > PENDING_STALE_SEC:
-                    for k in keys:
-                        st["sent"][k]["status"] = "stale"
-                    alert_async(f"⚠️ tx unmined 10min (stuck nonce?): {txh}")
-                continue
+                continue                     # not mined yet — re-read next pass
             status = _rcpt_status(rcpt)
             if status is None:
                 # undecided, NOT reverted: leave it pending and re-read next pass. Booking this
@@ -935,9 +1092,21 @@ def main() -> None:
         st = load_state()
         st["consec_reverts"] = 0
         st["gas_usd"] = 0.0
-        st["sent"] = {}
+        # Clear the DEDUP JOURNAL but KEEP anything still in flight. reset is the documented
+        # kill-switch recovery and gets run in a hurry, mid-incident, with txs on the wire —
+        # wiping those records is not a reset, it is losing them: their gas is never reconciled
+        # against the receipt, a revert that lands afterwards never reaches consec_reverts (so the
+        # operator re-arms the bot straight back into the failure that tripped it), and the
+        # borrower is instantly re-fireable while the first tx is still live. Settled records are
+        # exactly what reset is for and go. Preserving in-flight ones is safe: gas_usd is clamped
+        # at zero in _settle_gas, so their provisional charge cannot refund into the reset budget.
+        inflight = {k: v for k, v in st.get("sent", {}).items()
+                    if v.get("status") in ("pending", "stale")}
+        st["sent"] = inflight
         save_state(st)
-        print("guard/dedup reset")
+        kept = (f"; KEPT {len(inflight)} in-flight tx record(s) for receipt settlement"
+                if inflight else "")
+        print(f"guard/dedup reset{kept}")
     else:
         print(__doc__)
 

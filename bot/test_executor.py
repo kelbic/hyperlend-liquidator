@@ -217,6 +217,11 @@ def _capture_alerts(fn, wait_n=0):
         sent.append(urllib.parse.parse_qs(req.data.decode())["text"][0])
         return None
 
+    # let any alert_async daemon thread left over from an EARLIER test finish before we hijack the
+    # transport, so its text cannot be miscounted as one of ours
+    for t in list(threading.enumerate()):
+        if t is not threading.current_thread():
+            t.join(1.0)
     o_open, o_env, o_chat = urllib.request.urlopen, C.TG_ENV_FILE, C.TG_CHAT_ID
     with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
         f.write("TELEGRAM_BOT_TOKEN=tok\n")
@@ -363,7 +368,7 @@ def _armed_raw(fake_write, contract=_TEST_CONTRACT):
          E._nonce_cache.copy(), E._owner_addr)
     C.DRY_RUN, C.CONTRACT, C.PRIVATE_KEY, C.RAW_TX = False, contract, _TEST_KEY, True
     E._rpc_write = fake_write
-    E._nonce_cache.update({"addr": None, "next": None})
+    E._nonce_cache.update({"addr": None, "next": None, "send_ts": 0.0})
     E._owner_addr = None
     return o
 
@@ -451,22 +456,91 @@ def test_nonce_advances_only_after_a_successful_broadcast():
         _restore_raw(o)
 
 
-def test_nonce_does_not_move_when_the_broadcast_fails():
+def _verdict(msg="invalid sender"):
+    """A node's in-body JSON-RPC refusal — the ONLY kind of send failure that proves the tx is in
+    no mempool. This is what _rpc_write raises for an `error` field in the response body."""
     def boom(raw):
-        raise RuntimeError("connection reset by peer")
+        raise E.RpcVerdict(f"rpc eth_sendRawTransaction: "
+                           f"{{'code': -32000, 'message': '{msg}'}}")
+    return boom
 
-    fw = _FakeWrite(pending_nonce=7, send=boom)
+
+def test_nonce_does_not_move_when_the_node_refuses_the_tx():
+    """A REFUSED tx (node verdict) is in no mempool, so its nonce must stay free — advancing it
+    would leave a hole that stalls every later tx behind it.
+
+    Was `connection reset by peer`, which is the opposite case: that proves nothing about
+    delivery, and the nonce must move (see test_ambiguous_broadcast_owns_its_nonce)."""
+    fw = _FakeWrite(pending_nonce=7, send=_verdict())
     o = _armed_raw(fw)
     try:
         E._sign_and_send("0xaa")
-    except RuntimeError:
+    except E.SendUndelivered:
         pass
+    except Exception as e:
+        raise AssertionError(f"a node verdict must surface as SendUndelivered, got {e!r}")
     else:
-        raise AssertionError("a failed broadcast must propagate")
+        raise AssertionError("a refused broadcast must propagate")
     finally:
         cache = dict(E._nonce_cache)
         _restore_raw(o)
-    assert cache["next"] is None, f"nonce advanced on a FAILED send: {cache}"
+    assert cache["next"] is None, f"nonce advanced on a REFUSED send: {cache}"
+
+
+def test_ambiguous_broadcast_owns_its_nonce():
+    """A tx we cannot rule out is live must keep its nonce. Reusing it means two signed txs
+    competing for one slot — one of them is guaranteed to be wasted gas, and if the loser is the
+    one that mines, the liquidation we thought we sent never happened."""
+    fw = _FakeWrite(pending_nonce=7,
+                    send=lambda raw: (_ for _ in ()).throw(TimeoutError("hard deadline 10s")))
+    o = _armed_raw(fw)
+    try:
+        E._sign_and_send("0xaa")
+    except E.SendAmbiguous as e:
+        assert e.tx_hash.startswith("0x") and len(e.tx_hash) == 66, e.tx_hash
+    else:
+        raise AssertionError("an ambiguous broadcast must propagate")
+    finally:
+        cache = dict(E._nonce_cache)
+        _restore_raw(o)
+    assert cache["next"] == 8, f"maybe-sent tx did not own its nonce: {cache}"
+
+
+def test_already_known_is_a_delivered_send_not_a_refusal():
+    """"already known" means the node HAS the tx in its pool — a duplicate ack, not a rejection.
+    Booking it as a send error would abandon a tx that is on its way to being mined."""
+    fw = _FakeWrite(pending_nonce=7, send=_verdict("already known"))
+    o = _armed_raw(fw)
+    try:
+        txh = E._sign_and_send("0xaa")
+        assert txh.startswith("0x") and len(txh) == 66, txh
+        assert E._nonce_cache["next"] == 8, E._nonce_cache
+    finally:
+        _restore_raw(o)
+
+
+def test_local_nonce_resyncs_down_once_the_send_window_expires():
+    """A tx evicted from the mempool sends the node's 'pending' back to N while the local counter
+    sits at N+1. The counter used to be monotonic, so every later shot was signed past a hole the
+    sequencer will never fill and NOTHING mined again until a restart — a silently disarmed
+    liquidator. Outside the send window the chain must win even though it is lower."""
+    fw = _FakeWrite(pending_nonce=7)
+    o = _armed_raw(fw)
+    try:
+        E._sign_and_send("0xaa")
+        assert E._nonce_cache["next"] == 8
+        fw.pending_nonce = 7                       # tx dropped: the node is back at 7 for good
+        # still inside the window: the bump is a still-propagating send, keep it
+        assert E._pending_nonce(E.owner_address()) == 8
+        # ...and once the window closes, heal back down to the chain
+        E._nonce_cache["send_ts"] = time.monotonic() - E.NONCE_SEND_WINDOW_SEC - 1
+        assert E._pending_nonce(E.owner_address()) == 7, E._nonce_cache
+        assert E._nonce_cache["next"] == 7, "the dead bump must be dropped, not just ignored"
+        # and it must STAY healed — nothing but a real send may refresh send_ts
+        for _ in range(5):
+            assert E._pending_nonce(E.owner_address()) == 7
+    finally:
+        _restore_raw(o)
 
 
 # ------------------------------------------------------------------- fire(): non-blocking
@@ -522,10 +596,10 @@ def test_fire_raw_never_waits_on_telegram():
 
 
 def test_fire_raw_send_error_is_not_a_revert():
-    """FLEET DISCIPLINE: a transport/signing failure before the broadcast means nothing executed
-    on-chain. Feeding it to consec_reverts would let an RPC brownout trip the kill-switch and take
-    the bot down for the entire crash window — the only window it earns in."""
-    fw = _FakeWrite(send=lambda raw: (_ for _ in ()).throw(RuntimeError("all write RPCs down")))
+    """FLEET DISCIPLINE: a PROVEN non-delivery — here the node's own verdict — means nothing
+    executed on-chain. Feeding it to consec_reverts would let an RPC brownout trip the kill-switch
+    and take the bot down for the entire crash window — the only window it earns in."""
+    fw = _FakeWrite(send=_verdict("invalid sender"))
     st = _fire_raw_once(fw)
     rec = st["sent"][_T["borrower"]]
     assert rec["status"] == "send_error", rec
@@ -533,6 +607,63 @@ def test_fire_raw_send_error_is_not_a_revert():
     assert st["reverts"] == 0
     assert st["fires"] == 0, "nothing was broadcast — not a fire"
     assert st["gas_usd"] == 0.0, "no gas is burned by a tx that never reached the chain"
+
+
+def test_fire_raw_encode_failure_is_a_send_error():
+    """A failure BEFORE the wire (bad calldata, missing key) is proven non-delivery too."""
+    bad_ev = dict(_EV, swap_target="not-an-address")
+    o = _armed_raw(_FakeWrite())
+    st = _fresh_state()
+    try:
+        E.fire(dict(_T), bad_ev, st, 1_000_000.0, 0.01)
+    finally:
+        _restore_raw(o)
+    assert st["sent"][_T["borrower"]]["status"] == "send_error", st["sent"]
+    assert st["fires"] == 0 and st["gas_usd"] == 0.0
+
+
+def test_ambiguous_broadcast_is_tracked_as_pending_not_lost():
+    """[BLOCKER] The node accepted the tx; our 10s wall fired before the answer came back. The
+    old path called that a send_error: no pending record, so the real gas burned outside the $5
+    daily cap, a revert could never reach consec_reverts, and DEDUP_SEC freed the borrower after
+    60s — a SECOND liquidation of a position the first tx had already cured. The tx must be
+    tracked on its locally computed hash so a receipt still settles it."""
+    def node_took_it_but_never_answered(raw):
+        raise TimeoutError("hard deadline 10.0s exceeded")
+
+    fw = _FakeWrite(send=node_took_it_but_never_answered)
+    st = _fire_raw_once(fw, gas_usd=0.62)
+    rec = st["sent"][_T["borrower"]]
+    assert rec["status"] == "pending", f"an ambiguous send must NOT be dropped: {rec}"
+    assert rec["tx"].startswith("0x") and len(rec["tx"]) == 66, rec
+    assert st["fires"] == 1
+    assert st["gas_usd"] == 0.62, "gas that may really burn must sit under the daily cap"
+    assert st["consec_reverts"] == 0, "an unknown outcome is not a revert"
+    # and the borrower is blocked until that record settles — no second shot on a 60s dedup
+    assert E.recently_fired(st, _T["borrower"], 1_000_000.0 + C.DEDUP_SEC + 1)
+
+
+def test_ambiguous_broadcast_hash_matches_the_hash_the_node_would_report():
+    """The tracked hash is only useful if it is the SAME hash the chain will index the tx under —
+    it is derived from the signed payload, so it must equal what a healthy send returns."""
+    seen = {}
+    fw_ok = _FakeWrite(send=lambda raw: seen.setdefault("raw", raw) or "0x" + "f" * 64)
+    o = _armed_raw(fw_ok)
+    try:
+        E._sign_and_send("0xdeadbeef")
+    finally:
+        _restore_raw(o)
+    fw_amb = _FakeWrite(send=lambda raw: (_ for _ in ()).throw(TimeoutError("wall")))
+    o = _armed_raw(fw_amb)
+    try:
+        E._sign_and_send("0xdeadbeef")
+    except E.SendAmbiguous as e:
+        got = e.tx_hash
+    finally:
+        _restore_raw(o)
+    from eth_utils import keccak
+    from hexbytes import HexBytes
+    assert got == "0x" + keccak(HexBytes(seen["raw"])).hex(), got
 
 
 def test_fire_raw_charges_provisional_gas_exactly_once():
@@ -573,12 +704,15 @@ def _pending_state(gas_usd=0.5, ts=1_000_000.0):
 
 
 def _run_check(rpc, st, now_ts=1_000_010.0):
-    o_dry = C.DRY_RUN
-    C.DRY_RUN = False
+    """alert_async is stubbed out: these tests are about state, and its daemon threads would
+    otherwise still be in flight when a LATER test patches the Telegram transport to capture its
+    own alerts — a cross-test race, not a product bug."""
+    o_dry, o_async = C.DRY_RUN, E.alert_async
+    C.DRY_RUN, E.alert_async = False, lambda text: None
     try:
         E._check_pending(rpc, st, now_ts)
     finally:
-        C.DRY_RUN = o_dry
+        C.DRY_RUN, E.alert_async = o_dry, o_async
     return st
 
 
@@ -662,6 +796,135 @@ def test_pending_target_is_not_refired_before_it_settles():
     assert E.recently_fired(st, "0xabc", 1000.0 + 10_000)
     st["sent"]["0xabc"]["status"] = "ok"           # settled -> normal dedup applies again
     assert not E.recently_fired(st, "0xabc", 1000.0 + C.DEDUP_SEC + 1)
+
+
+def test_gas_settle_after_the_utc_roll_cannot_go_negative():
+    """[MAJOR] Shots fired just before midnight UTC settle just after it. _roll_day zeroes the
+    counter and the settle then refunded each provisional charge out of the FRESH day — measured
+    -$4.94 with 8 in-flight shots at $0.62, i.e. the $5 cap silently became a ~$10 cap on the day
+    after a busy one, which is exactly the day after a crash cascade."""
+    st = {"day": "2026-07-19", "gas_usd": 0.0, "consec_reverts": 0, "reverts": 0, "sent": {}}
+    for i in range(8):                                  # 8 shots on the 19th, $0.62 provisional
+        st["sent"][f"0xb{i}"] = {"ts": 1_000_000.0, "status": "pending", "tx": "0x" + f"{i:064x}",
+                                 "gas_usd": 0.62, "gas_day": "2026-07-19"}
+    st["gas_usd"] = 8 * 0.62
+    E._roll_day(st, "2026-07-20")                       # midnight UTC
+    assert st["gas_usd"] == 0.0 and st["day"] == "2026-07-20"
+    rpc = _FakeRcptRpc({rec["tx"]: _rcpt("0x1", gas_used=1, price=1)
+                        for rec in list(st["sent"].values())})
+    _run_check(rpc, st)
+    assert st["gas_usd"] >= 0.0, f"yesterday's charges refunded into today's budget: {st}"
+    assert all(r["status"] == "ok" for r in st["sent"].values())
+
+
+def test_gas_settle_undoes_the_provisional_charge_within_the_same_day():
+    """The day guard must not break the normal case: same-day settle still swaps the estimate for
+    the real cost, so one shot is never charged twice."""
+    st = {"day": "2026-07-19", "gas_usd": 0.5, "consec_reverts": 0, "reverts": 0,
+          "sent": {"0xb": {"ts": 1_000_000.0, "status": "pending", "tx": _TXH,
+                           "gas_usd": 0.5, "gas_day": "2026-07-19"}}}
+    _run_check(_FakeRcptRpc({_TXH: _rcpt("0x1")}), st)
+    assert abs(st["gas_usd"] - 1_000_000 * 10 ** 9 / 1e18 * C.HYPE_USD) < 1e-9, st["gas_usd"]
+
+
+def test_pending_is_released_even_when_the_receipt_read_keeps_throwing():
+    """[MAJOR] The stale wall used to live inside the `not mined yet` branch, reachable only when
+    an endpoint answered cleanly. With the endpoint down the read threw every pass, the record
+    stayed "pending" — and recently_fired() blocks a pending target regardless of age — so one
+    dead endpoint locked the borrower out of the fire path until the 24h purge."""
+    st = _pending_state(ts=1_000_000.0)
+    rpc = _FakeRcptRpc({_TXH: RuntimeError("endpoint down")})
+    _run_check(rpc, st, now_ts=1_000_000.0 + E.PENDING_STALE_SEC - 1)
+    assert st["sent"]["0xborrower"]["status"] == "pending"
+    assert E.recently_fired(st, "0xborrower", 1_000_000.0 + E.PENDING_STALE_SEC - 1)
+    _run_check(rpc, st, now_ts=1_000_000.0 + E.PENDING_STALE_SEC + 1)
+    assert st["sent"]["0xborrower"]["status"] == "stale", \
+        f"a permanently failing read must still hit the stale wall: {st['sent']}"
+    freed = 1_000_000.0 + E.PENDING_STALE_SEC + 1 + C.DEDUP_SEC
+    assert not E.recently_fired(st, "0xborrower", freed), "target still blocked after the wall"
+
+
+def test_a_stale_tx_that_mines_later_still_books_its_revert_and_gas():
+    """[MAJOR] "stale" means unmined for 10 min, NOT decided — HyperEVM can mine it afterwards.
+    Dropping stale records from the poll meant a late revert never reached consec_reverts and its
+    gas was never reconciled, while the borrower had already been released: the kill-switch went
+    blind to the exact pattern it exists to stop (a target that keeps reverting)."""
+    st = _pending_state(gas_usd=0.5, ts=1_000_000.0)
+    rpc = _FakeRcptRpc({_TXH: None})
+    _run_check(rpc, st, now_ts=1_000_000.0 + E.PENDING_STALE_SEC + 1)
+    assert st["sent"]["0xborrower"]["status"] == "stale"
+    rpc.receipts[_TXH] = _rcpt("0x0", gas_used=900_000, price=10 ** 9)   # mined late, REVERTED
+    # stale txs are polled at STALE_POLL_SEC, not every pass (24h of hot-loop reads otherwise)
+    n = len(rpc.calls)
+    _run_check(rpc, st, now_ts=1_000_000.0 + E.PENDING_STALE_SEC + 2)
+    assert len(rpc.calls) == n, "stale poll must be throttled, not run every iteration"
+    _run_check(rpc, st, now_ts=1_000_000.0 + E.PENDING_STALE_SEC + E.STALE_POLL_SEC + 1)
+    assert st["sent"]["0xborrower"]["status"] == "revert", st["sent"]
+    assert st["consec_reverts"] == 1, "a late revert must still feed the kill-switch"
+    assert st["reverts"] == 1
+    expected = 900_000 * 10 ** 9 / 1e18 * C.HYPE_USD
+    assert abs(st["gas_usd"] - expected) < 1e-9, f"stale tx gas never reconciled: {st['gas_usd']}"
+
+
+def test_receipt_without_effective_gas_price_falls_back_to_the_estimate():
+    """[MINOR] `.get("effectiveGasPrice", "0x0")` scored such a receipt at $0.00 while real gas
+    burned — the daily cap goes blind — where the same missing field on gasUsed correctly kept the
+    estimate. Missing means unknown, not free."""
+    st = _pending_state(gas_usd=0.42)
+    rcpt = {"status": "0x1", "gasUsed": hex(1_000_000), "blockNumber": "0x64"}
+    _run_check(_FakeRcptRpc({_TXH: rcpt}), st)
+    assert st["sent"]["0xborrower"]["status"] == "ok"
+    assert st["gas_usd"] == 0.42, f"gas silently zeroed: {st['gas_usd']}"
+
+
+def test_integer_receipt_fields_are_parsed_not_treated_as_garbage():
+    """[MINOR] A normalizing node/proxy returns status/gasUsed as JSON ints. Read as unparsable,
+    the win was never booked and the borrower stayed blocked until the stale wall — the bot going
+    quiet against a node that did nothing wrong."""
+    assert E._rcpt_status({"status": 1}) == 1
+    assert E._rcpt_status({"status": 0}) == 0
+    assert E._rcpt_status({"status": "0x1"}) == 1        # hex still works
+    assert E._rcpt_status({"status": None}) is None      # and garbage is still garbage
+    assert E._rcpt_status({"status": "junk"}) is None
+    st = _pending_state(gas_usd=0.5)
+    _run_check(_FakeRcptRpc({_TXH: {"status": 1, "gasUsed": 1_000_000,
+                                    "effectiveGasPrice": 10 ** 9}}), st)
+    assert st["sent"]["0xborrower"]["status"] == "ok", st["sent"]
+    expected = 1_000_000 * 10 ** 9 / 1e18 * C.HYPE_USD
+    assert abs(st["gas_usd"] - expected) < 1e-9, st["gas_usd"]
+
+
+def test_reset_keeps_in_flight_records_so_their_receipts_still_settle():
+    """[MINOR] reset is the documented kill-switch recovery, run in a hurry mid-incident with txs
+    on the wire. Wiping st["sent"] wholesale lost those: their gas was never reconciled and a
+    revert landing afterwards never reached consec_reverts, so the operator re-armed the bot
+    straight back into the failure that had just tripped it."""
+    import json
+    import tempfile
+    st = {"day": "2026-07-19", "gas_usd": 4.9, "consec_reverts": 3, "passes": 1, "fires": 2,
+          "reverts": 1, "sent": {
+              "0xlive": {"ts": 1_000_000.0, "status": "pending", "tx": _TXH, "gas_usd": 0.6,
+                         "gas_day": "2026-07-19"},
+              "0xstuck": {"ts": 1_000_000.0, "status": "stale", "tx": "0x" + "a" * 64,
+                          "gas_usd": 0.6, "gas_day": "2026-07-19"},
+              "0xdone": {"ts": 1_000_000.0, "status": "ok", "tx": "0x" + "b" * 64},
+              "0xold": {"ts": 1_000_000.0, "status": "revert", "tx": "0x" + "c" * 64}}}
+    with tempfile.TemporaryDirectory() as d:
+        o_file, o_argv = C.STATE_FILE, sys.argv
+        C.STATE_FILE = os.path.join(d, "state.json")
+        sys.argv = ["executor", "reset"]
+        try:
+            E.save_state(st)
+            E.main()
+            after = json.load(open(C.STATE_FILE))
+        finally:
+            C.STATE_FILE, sys.argv = o_file, o_argv
+    assert after["consec_reverts"] == 0 and after["gas_usd"] == 0.0, after
+    assert set(after["sent"]) == {"0xlive", "0xstuck"}, \
+        f"reset dropped in-flight txs (or kept settled ones): {after['sent']}"
+    # and the preserved charge cannot refund into the reset budget
+    E._settle_gas(after, after["sent"]["0xlive"], _rcpt("0x1", gas_used=1, price=1))
+    assert after["gas_usd"] >= 0.0, after["gas_usd"]
 
 
 # ------------------------------------------------------------------- cast fallback: key hygiene
