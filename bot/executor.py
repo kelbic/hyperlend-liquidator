@@ -1064,7 +1064,8 @@ def loop() -> None:
     # endpoint benching, so one black-holing endpoint can NEVER wedge the single-threaded loop
     # (a 25s socket timeout demonstrably did not stop a 33s multicall stall — see analysis/rpc.py).
     rpc = Rpc(C.READ_RPCS, timeout=C.RPC_TIMEOUT, retries=C.RPC_RETRIES, min_interval=0.05,
-              backoff_429=0.2, hard_timeout=C.RPC_HARD_TIMEOUT, bench_sec=C.RPC_BENCH_SEC)
+              backoff_429=0.2, hard_timeout=C.RPC_HARD_TIMEOUT, bench_sec=C.RPC_BENCH_SEC,
+              slow_sec=C.RPC_SLOW_SEC)
     reserves_cfg = load_reserves(rpc, book)   # cached in book; no RPC if already present
     save_book(book)
     banner = (f"▶️ hyperlend executor started (DRY_RUN={'on' if C.DRY_RUN else 'OFF'}, "

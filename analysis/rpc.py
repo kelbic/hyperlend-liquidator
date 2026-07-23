@@ -101,7 +101,8 @@ def _is_retryable_rpc_error(code, message: str) -> bool:
 class Rpc:
     def __init__(self, urls: list[str] | None = None, timeout: float = 25.0, retries: int = 6,
                  min_interval: float = 0.03, backoff_429: float = 0.8,
-                 hard_timeout: float | None = None, bench_sec: float = 30.0):
+                 hard_timeout: float | None = None, bench_sec: float = 30.0,
+                 slow_sec: float = 2.0):
         self.urls = list(urls or DEFAULT_RPCS)
         self.timeout = timeout             # per-attempt socket timeout (per-recv, NOT total)
         self.retries = retries
@@ -113,6 +114,13 @@ class Rpc:
         # ever wedge the single-threaded loop for more than ~hard_timeout.
         self.hard_timeout = hard_timeout
         self.bench_sec = bench_sec         # how long a hung/failed endpoint is benched
+        # A SUCCESSFUL-but-SLOW endpoint is otherwise invisible: benching only tracked
+        # errors/timeouts, so a node answering correctly in 1-1.3s (measured 23.07: official
+        # rpc.hyperliquid.xyz under multicall load vs 0.27-0.49s peers) keeps its 1/N round-robin
+        # share and drags every Nth sweep call. Port of the midnight slow_sec lesson (20.07,
+        # tenderly 5s): a success slower than slow_sec benches the endpoint briefly so rotation
+        # routes around it — same mechanism as a 429, keyed on latency. 0/None disables.
+        self.slow_sec = slow_sec if slow_sec and slow_sec > 0 else None
         self._id = 0
         self._last_call = 0.0
         self._idx = 0                      # rotating endpoint cursor (advances every attempt)
@@ -162,7 +170,11 @@ class Rpc:
             url = self._pick_url(time.time())
             self._last_call = time.time()
             try:
-                return self._request(url, body)
+                t0 = time.monotonic()
+                res = self._request(url, body)
+                if self.slow_sec and time.monotonic() - t0 > self.slow_sec:
+                    self._bench(url, time.time())   # успех, но медленный — краткий бенч (см. __init__)
+                return res
             except RpcError as e:
                 # rate-limit / capacity / transient node error -> bench + rotate (never wedge or
                 # crash on a throttled endpoint mid-cascade); a genuine verdict propagates.

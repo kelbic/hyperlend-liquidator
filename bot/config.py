@@ -88,6 +88,11 @@ RPC_TIMEOUT = float(os.environ.get("HL_RPC_TIMEOUT", "8"))        # per-attempt 
 RPC_HARD_TIMEOUT = float(os.environ.get("HL_RPC_HARD_TIMEOUT", "10"))  # hard total wall cap (s)
 RPC_RETRIES = int(os.environ.get("HL_RPC_RETRIES", "3"))         # attempts (~one per endpoint)
 RPC_BENCH_SEC = float(os.environ.get("HL_RPC_BENCH_SEC", "30"))  # bench a failed/hung endpoint
+# Успешный-но-медленный ответ бенчит узел (порт midnight slow_sec, 23.07: официальный узел
+# отвечал 0.8-1.3с под multicall-нагрузкой против 0.27-0.49с у соседей и никогда не бенчился).
+# Дефолт 3с консервативен под наши 500-вызовные чанки (~112KB: здоровый узел ≤1.2с, нагруженный
+# легитимно до ~2.5с); 0 = выключить.
+RPC_SLOW_SEC = float(os.environ.get("HL_RPC_SLOW_SEC", "3"))
 
 # kill-switch / dedup
 MAX_DAILY_GAS_USD = float(os.environ.get("HL_MAX_DAILY_GAS_USD", "5"))

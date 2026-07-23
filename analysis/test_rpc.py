@@ -211,6 +211,42 @@ def test_get_logs_chunked_single_block_window_still_raises_fast():
     assert raised and r.calls == 1
 
 
+def test_slow_success_benches_endpoint():
+    """23.07: успешный-но-медленный узел (официальный 0.8-1.3с под multicall против 0.27-0.49с
+    у соседей) раньше был невидим для бенчинга и тянул каждый N-й запрос. Порт midnight
+    slow_sec: успех дольше порога бенчит узел, ротация обходит его."""
+    import time as _t
+    counts = {}
+
+    def _slow_good(_timeout):
+        _t.sleep(0.12)                       # медленнее порога 0.05
+        return _good(_timeout)
+    _install({BAD: _slow_good, GOOD: _good}, counts)
+    r = Rpc([BAD, GOOD], retries=3, min_interval=0.0, timeout=1.0, slow_sec=0.05)
+    assert r.chain_id() == 999               # call 1: BAD отвечает (медленно) -> результат отдан
+    assert r.chain_id() == 999               # call 2: BAD на скамейке -> сразу GOOD
+    assert counts[BAD] == 1, f"slow endpoint was re-picked: {counts}"
+    assert counts[GOOD] == 1
+
+
+def test_fast_success_not_benched_and_zero_disables():
+    counts = {}
+    _install({BAD: _good, GOOD: _good}, counts)
+    r = Rpc([BAD, GOOD], retries=3, min_interval=0.0, timeout=1.0, slow_sec=0.05)
+    assert r.chain_id() == 999 and r.chain_id() == 999
+    assert counts[BAD] == 1 and counts[GOOD] == 1   # быстрый успех не бенчится, честный RR
+    import time as _t
+    counts2 = {}
+
+    def _slow_good(_timeout):
+        _t.sleep(0.12)
+        return _good(_timeout)
+    _install({BAD: _slow_good, GOOD: _good}, counts2)
+    r2 = Rpc([BAD, GOOD], retries=3, min_interval=0.0, timeout=1.0, slow_sec=0)
+    assert r2.chain_id() == 999 and r2.chain_id() == 999
+    assert counts2[BAD] == 1 and counts2[GOOD] == 1  # slow_sec=0: выключено, RR не искажён
+
+
 def test_get_logs_chunked_sporadic_failures_still_complete():
     # the counter is CONSECUTIVE and resets on success: a long run with a transient error before
     # every window (6+ total failures, never 2 in a row) must still complete the whole range —
