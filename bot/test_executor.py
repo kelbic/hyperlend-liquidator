@@ -1025,6 +1025,102 @@ def test_cast_fallback_signs_via_argv_because_foundry_has_no_key_env():
     assert st["sent"][_T["borrower"]]["status"] == "ok"
 
 
+# Метки времени — эпохо-масштабные: в проде now_ts = time.time(), и троттл-окно
+# (BALANCE_ALERT_SEC=3600) заведомо позади. Маленькие метки вроде 1000.0 глушили бы
+# первый алерт троттлом и тестировали бы артефакт стенда, а не поведение бота.
+_T0 = 1_800_000_000.0
+
+
+def _balance_ctx(bal_wei, base_wei=10**8):
+    """Context: live, with eth_getBalance/eth_getBlockByNumber faked for the gas guard."""
+    o = (C.DRY_RUN, C.PRIVATE_KEY, E._rpc_write, E._owner_addr,
+         E._last_balance_check, E._last_balance_alert, E.alert)
+    C.DRY_RUN, C.PRIVATE_KEY = False, _TEST_KEY
+    E._owner_addr = None
+    E._last_balance_check = E._last_balance_alert = 0.0
+
+    def fake_write(method, params, budget=None):
+        if method == "eth_getBalance":
+            return hex(bal_wei)
+        if method == "eth_getBlockByNumber":
+            return {"baseFeePerGas": hex(base_wei)}
+        raise AssertionError(f"unexpected {method}")
+    E._rpc_write = fake_write
+    return o
+
+
+def _balance_restore(o):
+    (C.DRY_RUN, C.PRIVATE_KEY, E._rpc_write, E._owner_addr,
+     E._last_balance_check, E._last_balance_alert, E.alert) = o
+
+
+def test_balance_guard_blocks_when_underfunded():
+    """Осушённый EOA обязан ловиться ГАРДОМ, а не штормом «insufficient funds» в каскаде."""
+    o = _balance_ctx(bal_wei=1)                      # ~ноль
+    alerts = []
+    E.alert = lambda text, **kw: alerts.append(text)
+    try:
+        st = {}
+        assert E.check_balance(st, _T0, force=True) is False
+        assert any("LOW GAS BALANCE" in a for a in alerts), alerts
+        assert st["balance_hype"] == 0.0
+    finally:
+        _balance_restore(o)
+
+
+def test_balance_guard_passes_when_funded():
+    # конверт = GAS_LIMIT*(2*base + prio); берём заведомо больше
+    need = C.GAS_LIMIT * (2 * 10**8) * 10
+    o = _balance_ctx(bal_wei=need)
+    alerts = []
+    E.alert = lambda text, **kw: alerts.append(text)
+    try:
+        st = {}
+        assert E.check_balance(st, _T0, force=True) is True
+        assert alerts == [], alerts                  # молчит, когда всё в порядке
+        assert st["balance_hype"] > 0
+    finally:
+        _balance_restore(o)
+
+
+def test_balance_guard_fails_open_on_rpc_error():
+    """Флапающий RPC НЕ должен блокировать выстрел — гард падает открытым."""
+    o = _balance_ctx(bal_wei=1)
+    def boom(method, params, budget=None):
+        raise RuntimeError("rpc down")
+    E._rpc_write = boom
+    E.alert = lambda text, **kw: None
+    try:
+        assert E.check_balance({}, _T0, force=True) is True
+    finally:
+        _balance_restore(o)
+
+
+def test_balance_guard_force_bypasses_throttle():
+    """Периодическая проверка троттлится, но гейт ПЕРЕД выстрелом обязан считать заново."""
+    o = _balance_ctx(bal_wei=1)
+    E.alert = lambda text, **kw: None
+    try:
+        E._last_balance_check = _T0               # только что проверяли
+        assert E.check_balance({}, _T0 + 0.1) is True   # без force — троттл, пропускаем
+        assert E.check_balance({}, _T0 + 0.1, force=True) is False   # force — считаем реально
+    finally:
+        _balance_restore(o)
+
+
+def test_balance_alert_is_throttled():
+    """Один ⛽-алерт в час, а не на каждой итерации горячего цикла."""
+    o = _balance_ctx(bal_wei=1)
+    alerts = []
+    E.alert = lambda text, **kw: alerts.append(text)
+    try:
+        for i in range(5):
+            E.check_balance({}, _T0 + i, force=True)
+        assert len(alerts) == 1, alerts
+    finally:
+        _balance_restore(o)
+
+
 if __name__ == "__main__":
     import unittest
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

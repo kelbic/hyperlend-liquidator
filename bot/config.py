@@ -54,6 +54,15 @@ PRIORITY_GWEI = float(os.environ.get("HL_PRIORITY_GWEI", "0"))
 GAS_LIMIT = int(os.environ.get("HL_GAS_LIMIT", "2500000"))
 GAS_UNITS_EST = int(os.environ.get("HL_GAS_UNITS", "1500000"))  # for the gas-USD kill-switch only
 HYPE_USD = float(os.environ.get("HL_HYPE_USD", "45"))           # rough, gas-USD estimate only
+# --- EOA gas-balance guard (katana lesson, ported 24.07) ---------------------------------------
+# Гарда НЕ БЫЛО ВООБЩЕ: осушённый кошелёк вскрылся бы только штормом «insufficient funds»
+# посреди каскада — то есть ровно тогда, когда бот обязан стрелять. Нода отвергает tx, если
+# balance < GAS_LIMIT*maxFeePerGas (ПОЛНЫЙ конверт комиссии, не фактический расход).
+# Пол готовности = max(один конверт, BALANCE_FIRES выстрелов по текущей базе).
+# Стоит один eth_getBalance + один заголовок раз в BALANCE_CHECK_SEC.
+BALANCE_CHECK_SEC = float(os.environ.get("HL_BALANCE_CHECK_SEC", "600"))
+BALANCE_ALERT_SEC = float(os.environ.get("HL_BALANCE_ALERT_SEC", "3600"))
+BALANCE_FIRES = int(os.environ.get("HL_BALANCE_FIRES", "3"))
 
 POLL_SEC = float(os.environ.get("HL_POLL_SEC", "3"))            # base cadence (legacy once-loop only)
 # --- amortized hot-set loop (see bot/executor.py loop()) ---------------------------------------

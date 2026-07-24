@@ -207,6 +207,49 @@ def guard_ok(st: dict) -> tuple[bool, str]:
     return True, ""
 
 
+_last_balance_check = 0.0
+_last_balance_alert = 0.0
+
+
+def check_balance(st: dict, now_ts: float, force: bool = False) -> bool:
+    """EOA gas-balance guard (ported from katana, which learned it the hard way: there was NO
+    guard here either, so a drained wallet would surface ONLY as an 'insufficient funds'
+    send-error storm mid-cascade — exactly when the bot must be firing).
+
+    The node REJECTS a tx unless balance >= GAS_LIMIT*maxFeePerGas, i.e. the FULL fee envelope
+    (maxFee is a CAP, not the charge — but the node still requires it upfront). Readiness floor =
+    max(one envelope, BALANCE_FIRES fires' burn at the current base). Cheap: one eth_getBalance +
+    one header per BALANCE_CHECK_SEC (force=True bypasses the throttle for the pre-fire gate).
+
+    Fails OPEN (returns True) if the check itself errors — a flaky RPC must never block a fire.
+    Returns False + a throttled alert when underfunded."""
+    global _last_balance_check, _last_balance_alert
+    if not force and now_ts - _last_balance_check < C.BALANCE_CHECK_SEC:
+        return True
+    addr = owner_address()
+    if not addr:
+        return True
+    _last_balance_check = now_ts
+    try:
+        bal = int(_rpc_write("eth_getBalance", [addr, "latest"]), 16)
+        max_fee, priority = _fee_params()
+        base = max(0, (max_fee - priority) // 2)
+        per_fire = C.GAS_UNITS_EST * (base + priority)
+        need = max(C.GAS_LIMIT * max_fee, C.BALANCE_FIRES * per_fire)
+    except Exception as e:
+        print(f"balance check failed (skipped, fail-open): {e}")
+        return True
+    st["balance_hype"] = round(bal / 1e18, 6)
+    if bal >= need:
+        return True
+    if now_ts - _last_balance_alert > C.BALANCE_ALERT_SEC:
+        _last_balance_alert = now_ts
+        alert(f"⛽ LOW GAS BALANCE: {bal / 1e18:.4f} HYPE < floor {need / 1e18:.4f} HYPE "
+              f"(node needs GAS_LIMIT×maxFee = {C.GAS_LIMIT * max_fee / 1e18:.4f} HYPE per fire). "
+              f"Бот НЕ СМОЖЕТ выстрелить — пополнить {addr}.")
+    return False
+
+
 def recently_fired(st: dict, key: str, now_ts: float) -> bool:
     """Dedup: a fired target is blocked for DEDUP_SEC; a REVERTED target is blocked for the
     longer REVERT_COOLDOWN_SEC — retrying the same borrower next pass just burns the remaining
@@ -872,6 +915,12 @@ def process_targets(rpc: Rpc, targets: list, st: dict, now_ts: float, gas_usd: f
               f"cover=${t['repaid_usd']:,.0f} net={nets} impact={ev['impact']*100:.2f}% "
               f"profitable={ev['profitable']}")
         if ev["profitable"]:
+            # газ-гард ПЕРЕД каждым выстрелом (force: без троттла — решение принимается сейчас).
+            # Недофинансированный кошелёк = нода отвергнет tx; лучше один явный алерт, чем
+            # шторм send-error посреди каскада (урок katana).
+            if not C.DRY_RUN and not check_balance(st, now_ts, force=True):
+                print(f"  skip {key[:10]}… — недостаточно газа на EOA (см. ⛽-алерт)")
+                continue
             fire(t, ev, st, now_ts, gas_usd)
             fired.append(key)
     return fired
@@ -1107,6 +1156,8 @@ def loop() -> None:
             save_hotset(hs)
             sys.exit(1)   # non-zero: the watchdog must see FAILURE, not a clean exit
         heartbeat(st)
+        if not C.DRY_RUN:
+            check_balance(st, time.time())   # периодический газ-гард (троттлится внутри)
         save_state(st)
         save_hotset(hs)
         time.sleep(C.HOT_POLL_SEC)
