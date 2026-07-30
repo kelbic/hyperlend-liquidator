@@ -191,7 +191,9 @@ def _drive_iteration(book, hs, accounts_map, st=None):
 def test_hot_iteration_membership_cursor_and_fire():
     bs = [addr(i) for i in range(10)]
     book = {"borrowers": bs, "configs": {}}
-    hs = {"cursor": 0, "hot": []}
+    # tick=2 -> эта итерация станет третьей и покатит курсор (C.SWEEP_EVERY=3). Тест про
+    # SWEEP-итерацию; парный тест ниже проверяет итерацию без чанка.
+    hs = {"cursor": 0, "hot": [], "tick": C.SWEEP_EVERY - 1}
     accounts_map = {
         bs[0]: acct(0.95),          # in cursor chunk, HF<1 -> target + fired
         bs[1]: acct(1.20),          # in cursor chunk, < HOT_HF -> becomes hot
@@ -253,3 +255,58 @@ if __name__ == "__main__":
             print(f"FAIL {fn.__name__}: {e}")
     print(f"\n{len(fns) - failed}/{len(fns)} passed")
     sys.exit(1 if failed else 0)
+
+
+# ---------------------------------------------------------------- каденс hot-опроса (30.07)
+# Итерация читала hot(~220) ∪ chunk(500) = ~720 аккаунтов за 1.1–1.4с при блоке HyperEVM ~1с:
+# горячих опрашивали МЕДЛЕННЕЕ, чем движется чейн. Курсор теперь катится раз в SWEEP_EVERY.
+
+def _tick_plan(n_iters, sweep_every):
+    """Чистая модель решения do_sweep из executor.once_hotset (без сети)."""
+    hs = {"tick": 0}
+    out = []
+    for _ in range(n_iters):
+        tick = int(hs.get("tick", 0)) + 1
+        hs["tick"] = tick
+        out.append((sweep_every <= 1) or (tick % sweep_every == 0))
+    return out
+
+
+def test_sweep_every_1_is_byte_identical_to_old_behaviour():
+    assert _tick_plan(6, 1) == [True] * 6
+
+
+def test_sweep_every_3_sweeps_one_iteration_in_three():
+    plan = _tick_plan(9, 3)
+    assert plan == [False, False, True, False, False, True, False, False, True]
+    assert sum(plan) == 3
+
+
+def test_hot_only_iterations_still_read_the_hot_set():
+    """Пропуск чанка не имеет права уронить наблюдение за горячими — иначе экономия
+    латентности покупается слепотой ровно там, где деньги."""
+    from bot import executor as E
+    hot = {"0xa", "0xb"}
+    accounts = {"0xa": {"health_factor": int(1.05e18), "total_debt_base": 10 ** 12},
+                "0xb": {"health_factor": int(1.40e18), "total_debt_base": 10 ** 12}}
+    new = E.update_hotset(hot, accounts, 1.30, 500.0)
+    assert "0xa" in new          # остался горячим
+    assert "0xb" not in new      # вылечился и выпал — это ЧТЕНИЕ, а не пропуск
+
+
+def test_membership_survives_iterations_that_did_not_read_a_member():
+    """Горячий, которого в этой итерации не читали, обязан сохранить членство."""
+    from bot import executor as E
+    new = E.update_hotset({"0xa", "0xc"}, {"0xa": {"health_factor": int(1.01e18),
+                                                   "total_debt_base": 10 ** 12}}, 1.30, 500.0)
+    assert new == {"0xa", "0xc"}
+
+
+def test_hot_only_iteration_does_not_advance_the_cursor():
+    """Итерация без чанка обязана оставить курсор на месте и всё равно прочитать горячих."""
+    bs = [addr(i) for i in range(10)]
+    book = {"borrowers": bs, "configs": {}}
+    hs = {"cursor": 4, "hot": [bs[7]], "tick": 0}          # tick станет 1 -> без sweep
+    status, fired = _drive_iteration(book, hs, {bs[7]: acct(0.90)})
+    assert hs["cursor"] == 4 and status["chunk"] == 0      # книга не двигалась
+    assert status["n_targets"] == 1 and fired == [bs[7]]   # горячий пойман без sweep

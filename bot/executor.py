@@ -1081,7 +1081,16 @@ def _hot_iteration(rpc: Rpc, book: dict, st: dict, hs: dict, gas_usd: float,
         _check_pending(rpc, st, now_ts)
     borrowers = book["borrowers"]
     hot = set(hs["hot"])
-    chunk, new_cursor, wrapped = next_chunk(borrowers, hs["cursor"], C.SWEEP_CHUNK)
+    # Курс катим не каждую итерацию: горячие важнее полноты книги, потому что именно они
+    # пересекают HF<1 в ближайшие секунды. Итерации без чанка стоят втрое дешевле и дают
+    # горячим опрос чаще блока чейна (см. C.SWEEP_EVERY).
+    tick = int(hs.get("tick", 0)) + 1
+    hs["tick"] = tick
+    do_sweep = (C.SWEEP_EVERY <= 1) or (tick % C.SWEEP_EVERY == 0)
+    if do_sweep:
+        chunk, new_cursor, wrapped = next_chunk(borrowers, hs["cursor"], C.SWEEP_CHUNK)
+    else:
+        chunk, new_cursor, wrapped = [], hs["cursor"], False
     to_read = list(dict.fromkeys(list(hot) + chunk))       # hot members re-read EVERY iteration
     accounts = sweep_accounts(rpc, to_read, retries=1)
 

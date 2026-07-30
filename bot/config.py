@@ -84,6 +84,14 @@ HOT_HF = float(os.environ.get("HL_HOT_HF", "1.30"))
 # per-iteration read stays ~2 round-trips / a few seconds (< the 8s budget). 25.5k / 500 = ~51
 # iterations, so the full book is re-swept every ~51*(work+HOT_POLL_SEC) ≈ 3-4 min continuously.
 SWEEP_CHUNK = int(os.environ.get("HL_SWEEP_CHUNK", "500"))
+# SWEEP_EVERY: катить курсор не каждую итерацию, а раз в N. Замер 30.07: итерация читает
+# hot(~220) ∪ chunk(500) = ~720 аккаунтов за 1.1–1.4с, а блок HyperEVM идёт ~1с — мы опрашивали
+# горячих МЕДЛЕННЕЕ, чем движется чейн, и пересечение HF<1 могло прожить целый блок незамеченным.
+# При N=3 две итерации из трёх читают только hot (~0.35с), и горячая позиция перечитывается
+# примерно вдвое чаще. Плата — полный цикл книги растягивается (~56с → ~90с), но это дёшево:
+# потолок hot-set HOT_HF=1.30 очень щедрый, чтобы выпасть из наблюдения, позиции надо рухнуть
+# с 1.30 до 1.0 внутри одного цикла. N=1 возвращает прежнее поведение ровно.
+SWEEP_EVERY = int(os.environ.get("HL_SWEEP_EVERY", "3"))
 # Cursor + hot-set persist here (repo data dir, NOT ~/.hyperlend-bot) so a restart resumes
 # mid-book with a warm hot set instead of re-scanning from zero.
 HOTSET_FILE = os.environ.get("HL_HOTSET_FILE", os.path.join(DATA_DIR, "hotset.json"))
