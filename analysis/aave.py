@@ -148,7 +148,7 @@ def liquidation_amounts(debt_pulled: int, debt_dec: int, debt_price: int,
 def size_liquidation(debt_wei: int, debt_dec: int, debt_price: int,
                      coll_wei: int, coll_dec: int, coll_price: int,
                      bonus_bps: int, fee_bps: int, total_debt_base: int, hf_1e18: int,
-                     safety: float = 0.995) -> dict:
+                     safety: float = 0.995, max_cover_wei: int | None = None) -> dict:
     """Compute a revert-free (debtToCover, expected received collateral) for one (debt,
     collateral) leg, honouring the per-reserve close factor, the MustNotLeaveDust rule and the
     liquidation protocol fee.
@@ -175,6 +175,15 @@ def size_liquidation(debt_wei: int, debt_dec: int, debt_price: int,
 
     max_liq_wei, cf = max_liquidatable_debt(debt_wei, debt_val, coll_val,
                                             total_debt_base, hf_1e18, debt_dec, debt_price)
+    # Лестница чанков (30.07): пул может не переварить полный размер — WHYPE→USDC на $734k
+    # давал impact 45% и отказ, а на 1/16 тот же долг проходит с +$1,947. Ограничение ставится
+    # ЗДЕСЬ, а не масштабированием результата: близкий к границе pull обязан пройти через
+    # ветку (c) с правилом MustNotLeaveDust — обе остаточные ноги >= $1000. Дублировать это
+    # правило в лестнице нельзя, иначе чанк ревертнет на Pool.
+    if max_cover_wei is not None:
+        max_liq_wei = min(max_liq_wei, max(0, max_cover_wei))
+        if max_liq_wei <= 0:
+            return zero
     # debt pull that seizes ALL collateral (Pool's own inverse formula, mirrored)
     debt_all_coll = percent_div(coll_price * coll_wei * unit_d // (debt_price * unit_c), bonus_bps)
 

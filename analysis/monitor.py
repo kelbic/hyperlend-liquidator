@@ -270,6 +270,11 @@ def _size_row(borrower: str, acct: dict, cfg: dict, prices: dict,
         "full_debt_close": sz["full_debt_close"], "full_coll_seize": sz["full_coll_seize"],
         "total_debt_usd": acct["total_debt_base"] / ORACLE_BASE_UNIT,
         "debt_sym": sym(d_addr), "coll_sym": sym(c_addr),
+        # сырые входы сайзинга — нужны лестнице чанков в evaluate(), чтобы пересчитать
+        # размер ИХ ЖЕ size_liquidation (с close factor и dust-правилом), а не масштабировать
+        # готовый результат арифметикой
+        "debt_wei": d_wei, "coll_wei": c_wei,
+        "total_debt_base": acct["total_debt_base"], "hf_1e18": hf,
     }
 
 

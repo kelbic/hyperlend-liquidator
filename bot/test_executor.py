@@ -1138,3 +1138,157 @@ if __name__ == "__main__":
     tail = f", {skipped} skipped" if skipped else ""
     print(f"\n{len(fns) - failed - skipped}/{len(fns)} passed{tail}")
     sys.exit(1 if failed else 0)
+
+
+# ------------------------------------------------------------- лестница чанков (30.07)
+# Две крупнейшие позиции флота ($734k и $342k WHYPE→USDC, чистый бонус $32.9k и $15.3k) были
+# недостижимы: evaluate() котировал ПОЛНЫЙ размер, получал impact 45–53% и отказывался. Бот при
+# этом не ошибался — он корректно молчал, поэтому дыра не оставляла следа в логе.
+
+_P = 100_000_000            # цена $1 в шкале оракула Aave (1e8)
+
+
+def _chunkable(debt_usd=100_000, coll_usd=140_000):
+    """Цель с сырыми входами сайзинга — как её теперь отдаёт _size_row."""
+    debt_wei = debt_usd * 10 ** 6
+    coll_wei = coll_usd * 10 ** 18 // 1        # цена коллатерала тоже $1 для простоты
+    from analysis.aave import size_liquidation
+    sz = size_liquidation(debt_wei, 6, _P, coll_wei, 18, _P, 11000, 1000,
+                          debt_usd * 10 ** 8, int(1.0 * 1e18))
+    t = {"borrower": "0x" + "ab" * 20, "hf": 0.99, "coll_sym": "WHYPE", "debt_sym": "USDC",
+         "coll_asset": "0x" + "c" * 40, "debt_asset": "0x" + "d" * 40,
+         "coll_dec": 18, "debt_dec": 6, "coll_price": _P, "debt_price": _P,
+         "bonus_bps": 11000, "fee_bps": 1000,
+         "debt_wei": debt_wei, "coll_wei": coll_wei,
+         "total_debt_base": debt_usd * 10 ** 8, "hf_1e18": int(1.0 * 1e18)}
+    t.update(sz)
+    return t
+
+
+def _with_quote(fn, t, gas_usd=0.01):
+    orig = liqd.quote_for_seized
+    liqd.quote_for_seized = fn
+    try:
+        return E.evaluate(t, gas_usd)
+    finally:
+        liqd.quote_for_seized = orig
+
+
+def test_max_cover_caps_the_pull_and_keeps_the_dust_rule():
+    """Ограничение ставится на max_liq_wei, поэтому чанк обязан пройти ветку MustNotLeaveDust:
+    обе остаточные ноги остаются выше порога, иначе Pool ревертнёт наш же выстрел."""
+    from analysis.aave import size_liquidation, MIN_LEFTOVER_USD, ORACLE_BASE_UNIT
+    debt_wei, coll_wei = 100_000 * 10 ** 6, 140_000 * 10 ** 18
+    full = size_liquidation(debt_wei, 6, _P, coll_wei, 18, _P, 11000, 1000,
+                            100_000 * 10 ** 8, int(1.0 * 1e18))
+    cap = full["debt_pulled"] // 8
+    part = size_liquidation(debt_wei, 6, _P, coll_wei, 18, _P, 11000, 1000,
+                            100_000 * 10 ** 8, int(1.0 * 1e18), max_cover_wei=cap)
+    assert 0 < part["debt_pulled"] <= cap
+    assert part["seized"] < full["seized"]
+    floor = MIN_LEFTOVER_USD * ORACLE_BASE_UNIT
+    left_debt = (debt_wei - part["debt_pulled"]) * _P // 10 ** 6
+    left_coll = (coll_wei - part["seized_gross"]) * _P // 10 ** 18
+    assert left_debt >= floor and left_coll >= floor
+
+
+def test_max_cover_zero_is_refused():
+    from analysis.aave import size_liquidation
+    z = size_liquidation(100_000 * 10 ** 6, 6, _P, 140_000 * 10 ** 18, 18, _P, 11000, 1000,
+                         100_000 * 10 ** 8, int(1.0 * 1e18), max_cover_wei=0)
+    assert z["debt_to_cover"] == 0 and z["seized"] == 0
+
+
+def test_ladder_is_lazy_when_full_size_wins():
+    """Обычная позиция не должна стоить ни одной лишней котировки — иначе лестница
+    оплачивается латентностью на каждом проходе."""
+    calls = []
+
+    def q(coll, debt, seized_wei, cd, dd):
+        calls.append(seized_wei)
+        return {"amount_out": 200_000 * 10 ** 6, "price_impact": 0.001,
+                "swap_target": "0xr", "swap_calldata": "0xcd", "amount_in_used": 0}
+
+    ev = _with_quote(q, _chunkable())
+    assert ev["profitable"] and ev["f"] == 1.0
+    assert len(calls) == 1
+
+
+def test_ladder_finds_the_chunk_when_full_size_is_too_big_for_the_pool():
+    """Ровно случай 30.07: полный размер даёт неподъёмный impact, четверть — проходит."""
+    t = _chunkable()
+
+    def q(coll, debt, seized_wei, cd, dd):
+        frac = seized_wei / t["seized"]
+        if frac > 0.30:                      # пул не переваривает крупный вход
+            return {"amount_out": seized_wei // 10 ** 12, "price_impact": 0.45,
+                    "swap_target": "0xr", "swap_calldata": "0xcd", "amount_in_used": 0}
+        return {"amount_out": int(seized_wei / 10 ** 12 * 1.02), "price_impact": 0.004,
+                "swap_target": "0xr", "swap_calldata": "0xcd", "amount_in_used": 0}
+
+    ev = _with_quote(q, t)
+    assert ev["profitable"], ev
+    assert ev["f"] < 1.0
+    assert ev["debt_to_cover"] < t["debt_to_cover"]
+    assert ev["net_usd"] >= C.MIN_PROFIT_USD
+
+
+def test_unprofitable_everywhere_reports_the_full_size():
+    """Когда не проходит ни один размер, в лог обязан вернуться ответ по ПОЛНОМУ размеру —
+    иначе оператор увидит impact крошечного чанка и не поймёт, что произошло."""
+    t = _chunkable()
+
+    def q(coll, debt, seized_wei, cd, dd):
+        return {"amount_out": seized_wei // 10 ** 12 // 2, "price_impact": 0.60,
+                "swap_target": "0xr", "swap_calldata": "0xcd", "amount_in_used": 0}
+
+    ev = _with_quote(q, t)
+    assert not ev["profitable"] and ev["f"] == 1.0
+
+
+def test_ladder_survives_old_cached_rows_without_raw_inputs():
+    """Строка из старого кэша книги не имеет сырых входов — лестница обязана деградировать
+    до прежнего поведения, а не падать."""
+    t = _chunkable()
+    for k in ("debt_wei", "coll_wei", "total_debt_base", "hf_1e18"):
+        t.pop(k)
+
+    def q(coll, debt, seized_wei, cd, dd):
+        return {"amount_out": seized_wei // 10 ** 12 // 2, "price_impact": 0.60,
+                "swap_target": "0xr", "swap_calldata": "0xcd", "amount_in_used": 0}
+
+    ev = _with_quote(q, t)
+    assert ev is not None and ev["f"] == 1.0 and not ev["profitable"]
+
+
+def test_no_route_at_full_size_still_tries_smaller():
+    """NoRouteError на полном размере не означает отсутствие маршрута вообще."""
+    t = _chunkable()
+
+    def q(coll, debt, seized_wei, cd, dd):
+        if seized_wei > t["seized"] // 4:
+            raise liqd.NoRouteError("no route")
+        return {"amount_out": int(seized_wei / 10 ** 12 * 1.03), "price_impact": 0.003,
+                "swap_target": "0xr", "swap_calldata": "0xcd", "amount_in_used": 0}
+
+    ev = _with_quote(q, t)
+    assert ev["profitable"] and ev["f"] <= 0.25
+
+
+def test_descent_is_bounded_by_economics():
+    """Спуск не должен уходить в размеры, которые физически не окупают порог и газ."""
+    fr = list(E._chunk_fractions(full_bonus_usd=100.0, gas_usd=0.01))
+    assert fr[0] == (1, 1)
+    f_lo = (C.MIN_PROFIT_USD + 0.01) / 100.0
+    assert all(n / d >= f_lo * 0.999 for n, d in fr[len(E.CHUNK_FRACTIONS):] or [(1, 1)])
+    assert list(E._chunk_fractions(None, 0.01)) == list(E.CHUNK_FRACTIONS)
+
+
+def test_eval_budget_scales_with_the_prize():
+    """Фиксированный бюджет обрывал обход на третьей ступени и терял цель с бонусом $32.9k
+    (замер 30.07: одна котировка LiquidSwap 1.7–3.5с)."""
+    assert E._eval_budget(None) == E.EVAL_DEADLINE_SEC
+    assert E._eval_budget(0) == E.EVAL_DEADLINE_SEC
+    assert E._eval_budget(50) == E.EVAL_DEADLINE_SEC            # мелочь: пол
+    assert E._eval_budget(32_890) > 25                          # тот самый случай
+    assert E._eval_budget(10 ** 9) == E.EVAL_DEADLINE_MAX_SEC   # потолок: каскад не встанет

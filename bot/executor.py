@@ -87,7 +87,7 @@ sys.path.insert(0, REPO)
 from bot import config as C                                    # noqa: E402
 from bot import liqd                                           # noqa: E402
 from analysis.aave import (                                    # noqa: E402
-    HF_INFINITY, SEL_GET_USER_ACCOUNT_DATA, decode_user_account_data,
+    HF_INFINITY, SEL_GET_USER_ACCOUNT_DATA, decode_user_account_data, size_liquidation,
 )
 from analysis.monitor import (                                 # noqa: E402
     discover_borrowers, load_book, load_reserves, refine, save_book, scan, sweep_accounts,
@@ -368,7 +368,93 @@ def fresh_hf(rpc: Rpc, borrower: str) -> float | None:
 
 
 # --------------------------------------------------------------------------- evaluate
+CHUNK_FRACTIONS = ((1, 1), (3, 4), (1, 2), (7, 20), (1, 4), (3, 20), (1, 10), (3, 50))
+MIN_CHUNK_FRACTION = float(os.environ.get("HL_MIN_CHUNK_FRACTION", "0.002"))
+# Бюджет обхода лестницы. Одна котировка LiquidSwap стоит 1.7–3.5с (замер 30.07), поэтому
+# фиксированные 6с обрывали обход на третьей ступени и цель с бонусом $32.9k возвращалась как
+# «неприбыльна» — та же дыра, только глубже. Бюджет пропорционален призу: искать выход для
+# $32k стоит трёх десятков секунд, для $50 — нет.
+# Сокращать обход по impact НЕЛЬЗЯ: маршрутизатор переключает маршрут скачком (замер: 29.7%
+# на 7/20 и 0.23% на 1/4), линейная экстраполяция impact пропустила бы лучшую ступень.
+EVAL_DEADLINE_SEC = float(os.environ.get("HL_EVAL_DEADLINE_SEC", "6"))
+EVAL_DEADLINE_MAX_SEC = float(os.environ.get("HL_EVAL_DEADLINE_MAX_SEC", "40"))
+EVAL_SEC_PER_BONUS_USD = float(os.environ.get("HL_EVAL_SEC_PER_BONUS_USD", "0.001"))
+
+
+def _chunk_fractions(full_bonus_usd: float | None, gas_usd: float):
+    """Доли полного закрытия, крупные первыми: статическая лестница, затем ограниченный
+    геометрический спуск. ЛЕНИВО: evaluate() выходит на первом прибыльном чанке, поэтому для
+    обычной позиции спуск не порождается вовсе и число котировок не меняется.
+
+    Нижняя граница экономическая: чанк меньше f_lo не окупит порог прибыли плюс газ, спускаться
+    туда бессмысленно (портировано из katana, где та же лестница работает с 20.07)."""
+    for num, den in CHUNK_FRACTIONS:
+        yield num, den
+    if not full_bonus_usd or full_bonus_usd <= 0:
+        return
+    f_lo = max((C.MIN_PROFIT_USD + gas_usd) / full_bonus_usd, MIN_CHUNK_FRACTION)
+    num, den = CHUNK_FRACTIONS[-1]
+    while True:
+        den *= 2
+        if num / den < f_lo:
+            return
+        yield num, den
+
+
+def _eval_budget(full_bonus_usd: float | None) -> float:
+    """Секунды на обход лестницы: пол для мелочи, потолок чтобы каскад не встал на одной цели."""
+    if not full_bonus_usd or full_bonus_usd <= 0:
+        return EVAL_DEADLINE_SEC
+    return min(EVAL_DEADLINE_MAX_SEC,
+               max(EVAL_DEADLINE_SEC, full_bonus_usd * EVAL_SEC_PER_BONUS_USD))
+
+
+def _resize(t: dict, num: int, den: int) -> dict | None:
+    """Пересайзить цель под долю пула ИХ ЖЕ size_liquidation: ограничиваем допустимый pull,
+    а close factor, MustNotLeaveDust и комиссию протокола пересчитывает боевая функция.
+    None, если сырых входов в строке нет (старый кэш) или чанк вырождается в ноль."""
+    if any(k not in t for k in ("debt_wei", "coll_wei", "total_debt_base", "hf_1e18")):
+        return None
+    cap = t["debt_pulled"] * num // den
+    if cap <= 0:
+        return None
+    sz = size_liquidation(t["debt_wei"], t["debt_dec"], t["debt_price"],
+                          t["coll_wei"], t["coll_dec"], t["coll_price"],
+                          t["bonus_bps"], t["fee_bps"], t["total_debt_base"], t["hf_1e18"],
+                          max_cover_wei=cap)
+    if sz["debt_to_cover"] <= 0 or sz["seized"] <= 0:
+        return None
+    return {**t, **sz}
+
+
 def evaluate(t: dict, gas_usd: float) -> dict | None:
+    """Лестница чанков поверх _evaluate_one: крупнейший прибыльный размер выигрывает.
+
+    30.07: без неё две крупнейшие позиции флота ($734k и $342k WHYPE→USDC, чистый бонус
+    $32.9k и $15.3k) были недостижимы — полный размер даёт impact 45–53%, бот корректно
+    отказывался и молчал. На 1/16 та же позиция проходит порог с +$1,947."""
+    first = None
+    deadline = time.monotonic() + _eval_budget(t.get("net_bonus_usd"))
+    for num, den in _chunk_fractions(t.get("net_bonus_usd"), gas_usd):
+        if first is not None and time.monotonic() > deadline:
+            break                       # бюджет прохода потрачен; полный размер уже в first
+        tt = t if den == 1 else _resize(t, num, den)
+        if tt is None:
+            continue
+        res = _evaluate_one(tt, gas_usd)
+        if res is None:
+            continue
+        res["f"] = num / den
+        if first is None:
+            first = res                 # ответ по полному размеру — он же и лог по умолчанию
+        if "skip" in res:
+            continue
+        if res.get("profitable"):
+            return res
+    return first
+
+
+def _evaluate_one(t: dict, gas_usd: float) -> dict | None:
     """Quote the exit for target `t` on LiquidSwap and gate on net profit. Returns fire params
     (swap_target, swap_calldata, min_profit_wei, net_usd, ...) or None if not profitable.
 
@@ -410,6 +496,9 @@ def evaluate(t: dict, gas_usd: float) -> dict | None:
         "proceeds": proceeds, "owed": owed, "net_wei": net_wei, "net_usd": net_usd,
         "impact": q["price_impact"], "min_profit_wei": min_profit_wei,
         "debt_to_cover": debt_to_cover, "seized": seized, "profitable": ok,
+        # размер чанка в USD — лог и алерт должны показывать РЕАЛЬНО закрываемую часть,
+        # иначе «cover=$367k» рядом с выстрелом на 1/16 читается как ошибка
+        "repaid_usd": t.get("repaid_usd"), "net_bonus_usd": t.get("net_bonus_usd"),
     }
 
 
@@ -911,9 +1000,10 @@ def process_targets(rpc: Rpc, targets: list, st: dict, now_ts: float, gas_usd: f
             print(f"  skip {key[:10]}… {t['coll_sym']}->{t['debt_sym']}: {ev['skip']}")
             continue
         nets = f"${ev['net_usd']:+,.1f}"
+        chunk = f" chunk={ev['f']:.0%}" if ev.get("f", 1.0) < 1.0 else ""
         print(f"  target {key[:10]}… HF={t['hf']:.4f} {t['coll_sym']}->{t['debt_sym']} "
-              f"cover=${t['repaid_usd']:,.0f} net={nets} impact={ev['impact']*100:.2f}% "
-              f"profitable={ev['profitable']}")
+              f"cover=${ev.get('repaid_usd') or t['repaid_usd']:,.0f}{chunk} net={nets} "
+              f"impact={ev['impact']*100:.2f}% profitable={ev['profitable']}")
         if ev["profitable"]:
             # газ-гард ПЕРЕД каждым выстрелом (force: без троттла — решение принимается сейчас).
             # Недофинансированный кошелёк = нода отвергнет tx; лучше один явный алерт, чем
