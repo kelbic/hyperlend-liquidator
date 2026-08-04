@@ -1144,19 +1144,41 @@ def _prearm_drop(borrower: str) -> None:
 
 def _prearm_quote(rpc: Rpc, book: dict, borrowers: list[str], accounts: dict,
                   reserves_cfg: dict, gas_usd: float) -> None:
-    """Фоновый поток: refine + evaluate на бритом размере, профитные — в кэш."""
+    """Фоновый поток: refine + evaluate на бритом размере, профитные — в кэш.
+
+    Берём ВТОРОЙ выход refine (`risk`): у кромки HF >= 1, а в `targets` попадают только
+    HF < 1 (analysis/monitor.py). Первая версия читала `targets` и потому была тихим
+    no-op — ровно тот отказ, который отличим от «нечего армить» только положительным
+    логом, поэтому итог прохода печатается ВСЕГДА.
+
+    Сайзим позицию в состоянии «только что пересекла» (hf=0.999): у здоровой позиции
+    close-factor и cover считаются от её текущего HF, а нам нужен размер на момент
+    пересечения. Арм применяется лишь при HF >= 0.95 (_prearm_get) — там тот же CF."""
+    skipped: list[str] = []
+    armed = 0
     try:
-        targets, _ = refine(rpc, book, accounts, borrowers, reserves_cfg,
-                            min_debt_usd=C.MIN_DEBT_USD, watch_hf=C.PREARM_HF,
-                            report_hf=C.PREARM_HF, retries=1)
-        for t in targets:
-            shaved = _resize(t, *C.PREARM_SHAVE) or t
+        _, risk = refine(rpc, book, accounts, borrowers, reserves_cfg,
+                         min_debt_usd=C.MIN_DEBT_USD, watch_hf=C.PREARM_HF,
+                         report_hf=C.PREARM_HF, retries=1)
+        for t in risk:
+            if t["coll_asset"].lower() == t["debt_asset"].lower():
+                # своп в тот же актив маршрута не имеет, а контракт свопает безусловно
+                skipped.append(f"{t['borrower'][:10]}…:одинаковый актив")
+                continue
+            hyp = dict(t, hf_1e18=int(0.999e18))
+            shaved = _resize(hyp, *C.PREARM_SHAVE) or hyp
             ev = evaluate(shaved, gas_usd)
             if ev and "skip" not in ev and ev.get("profitable"):
                 with _prearm_lock:
                     _prearm[t["borrower"]] = {"t": shaved, "ev": ev, "ts": time.monotonic()}
+                armed += 1
                 print(f"  ⚡ armed {t['borrower'][:10]}… HF={t['hf']:.4f} "
                       f"{shaved['coll_sym']}->{shaved['debt_sym']} net=${ev['net_usd']:+,.1f}")
+            else:
+                why = (ev or {}).get("skip", "неприбыльна" if ev else "нет строки")
+                skipped.append(f"{t['borrower'][:10]}…:{why[:40]}")
+        print(f"  prearm: кромка {len(borrowers)} -> строк {len(risk)}, армлено {armed}"
+              + (f", мимо: {'; '.join(skipped[:3])}" if skipped else ""))
     except Exception as e:                    # noqa: BLE001 — фон не смеет ронять процесс
         print(f"  prearm err: {e}")
     finally:

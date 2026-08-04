@@ -494,3 +494,37 @@ def test_process_targets_uses_armed_quote(prearm_env):
     st = {"sent": {}, "fires": 0, "gas_usd": 0.0, "day": "2026-08-04"}
     fired = ex.process_targets(None, [dict(t_cached, net_bonus_usd=50.0)], st, 1000.0, 1.0)
     assert fired == ["0xb"]
+
+
+def test_prearm_quotes_risk_rows_not_targets(prearm_env, capsys):
+    """РЕГРЕССИЯ: первая версия читала targets[] refine, а кромка (HF>=1) лежит в risk[] —
+    pre-arm был тихим no-op. Плюс: итог прохода печатается ВСЕГДА (положительное
+    доказательство работы, иначе no-op снова неотличим от «нечего армить»)."""
+    row = {"borrower": "0xb", "hf": 1.001, "coll_sym": "UBTC", "debt_sym": "USDC",
+           "coll_asset": "0x" + "11" * 20, "debt_asset": "0x" + "22" * 20,
+           "debt_wei": 10, "coll_wei": 10, "total_debt_base": 10, "hf_1e18": int(1.001e18),
+           "debt_pulled": 100}
+    prearm_env.setattr(ex, "refine", lambda *a, **k: ([], [row]))     # цель именно в risk
+    seen = {}
+    prearm_env.setattr(ex, "_resize", lambda t, n, d: dict(t, _shaved=(n, d), _hf=t["hf_1e18"]))
+    prearm_env.setattr(ex, "evaluate",
+                       lambda t, g: seen.update(t=t) or {"net_usd": 30.0, "profitable": True})
+    ex._prearm_quote(None, {}, ["0xb"], {}, {}, 1.0)
+    assert "0xb" in ex._prearm, "строка из risk обязана армиться"
+    assert seen["t"]["_hf"] == int(0.999e18), "сайзить нужно на момент ПЕРЕСЕЧЕНИЯ, не по текущему HF"
+    assert seen["t"]["_shaved"] == C.PREARM_SHAVE
+    assert "prearm:" in capsys.readouterr().out
+
+
+def test_prearm_skips_same_asset(prearm_env, capsys):
+    """Контракт свопает безусловно (swapTarget.call + revert), поэтому coll==debt не берём —
+    но отказ обязан быть ВИДИМЫМ, а не тихим."""
+    a = "0x" + "55" * 20
+    row = {"borrower": "0xs", "hf": 1.001, "coll_sym": "WHYPE", "debt_sym": "WHYPE",
+           "coll_asset": a, "debt_asset": a.upper(), "hf_1e18": int(1.001e18)}
+    prearm_env.setattr(ex, "refine", lambda *a_, **k: ([], [row]))
+    prearm_env.setattr(ex, "evaluate",
+                       lambda t, g: (_ for _ in ()).throw(AssertionError("котировка на coll==debt")))
+    ex._prearm_quote(None, {}, ["0xs"], {}, {}, 1.0)
+    assert "0xs" not in ex._prearm
+    assert "одинаковый актив" in capsys.readouterr().out
