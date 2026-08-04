@@ -22,12 +22,28 @@ executor'а.
     адаптер отвергает, и выстрел без изменения цены гарантированно ревертится HF-чеком).
 
 Карта DRIVERS: цена фасада = произведению значений фидов (доказано eth_call 04.08 бит-в-бит:
-WHYPE=A.HYPE; wstHYPE=A.wstHYPE_FUNDAMENTAL*A.HYPE, расхождение < 1e-6; UBTC=A.BTC;
+WHYPE=A.HYPE; wstHYPE=A.wstHYPE_FUNDAMENTAL*A.HYPE, расхождение 0.00000%; UBTC=A.BTC;
 UETH=B.ETH; USDT0=A.USDT; USOL=A.SOL; фасад USDH = фасад USDC — один адрес). Пуш адаптера
-двигает цену пула 1:1. kHYPE/beHYPE/PT-*/USDHL/USR в карте НЕТ: их фасады не раскрывают
-getPriceFeedAdapter(), а числовая сверка не бьётся ни с одной комбинацией известных фидов
-(kHYPE 56.2778 против B.kHYPE 56.2733 — близко, но НЕ равно) — spec по ним не стреляет,
-реактивный путь их берёт как раньше.
+двигает цену пула 1:1.
+
+kHYPE-семейство добавлено 04.08 РАЗБОРОМ ACCESSLIST'ОМ (урок JitoSOL: безногий фасад ≠
+мёртвый). eth_createAccessList на getAssetPrice() показывает ровно те слоты адаптеров, что
+читает фасад; слот значения опознаётся сверкой с getLastUpdateDetails по всем 861 фидам
+гейтвея. Итог: kHYPE = A.«kHYPE_FUNDAMENTAL/USD» ОДНИМ слотом (бит-в-бит 56.850876), НЕ
+композиция с HYPE — предыдущий вывод «обе ноги одна семья ⇒ HF иммунен к цене» был неверен
+на уровне оракула; beHYPE = A.HYPE*A.beHYPE_MAIN_FUNDAMENTAL (0.00000%).
+
+PT-* читают HYPE-слот (SEP2026 — адаптера A, MAR2026 — B) плюс слот контракта дисконта
+Pendle, который RedStone не пушит. Для plan() это законно: он считает МАСШТАБ (gw/chain),
+а постоянный множитель в масштабе сокращается — замер 8ч: PT/HYPE = 0.995877 -> 0.995850,
+дрейф 0.0027% против порога девиации 0.5%.
+
+Асинхронность ног — источник добычи, а не помеха: в 156 пушах за 6ч tx с HYPE — 35, tx с
+kHYPE* — 17, ОБЩИХ НОЛЬ; ряд kHYPE/HYPE за 8ч гулял 1.0194..1.0246 (±0.5%). Пуш HYPE
+переоценивает долг WHYPE, залог kHYPE стоит на прежнем значении до своего пуша — окно.
+
+USDHL (Pyth, пермишенлесс — бэклог-полигон) и USR (константа $0.5) в карте по-прежнему НЕТ;
+реактивный путь берёт их как раньше.
 
 Оценка HF при подмене цен (plan): HF_est = HF * (f_c*(s_c-1)+1) / (f_d*(s_d-1)+1), где
 s_c/s_d — произведение масштабов gw/chain фидов-драйверов НА ПУШЕННОМ адаптере (фиды другого
@@ -73,6 +89,20 @@ DRIVERS: dict[str, list[tuple[str, str]]] = {
     _addr("sUSDe"):   [("sUSDe", ADAPTER_A)],
     _addr("USOL"):    [("SOL", ADAPTER_A)],
 }
+
+# kHYPE-семейство (04.08, accessList-разбор): ~$584k бонуса ближней кромки было слепо для
+# предиктивного слоя. Отдельным блоком под флагом — ОТКАТ C.SPEC_KHYPE=0 возвращает карту к
+# составу до разбора, не трогая доказанное ядро выше.
+KHYPE_DRIVERS: dict[str, list[tuple[str, str]]] = {
+    _addr("kHYPE"):   [("kHYPE_FUNDAMENTAL/USD", ADAPTER_A)],
+    _addr("beHYPE"):  [("beHYPE_MAIN_FUNDAMENTAL", ADAPTER_A), ("HYPE", ADAPTER_A)],
+    # PT-*: постоянный множитель дисконта Pendle сокращается в масштабе (дрейф 0.0027%/8ч)
+    _addr("PT-kHYPE-24SEP2026"): [("HYPE", ADAPTER_A)],
+    _addr("PT-kHYPE-19MAR2026"): [("HYPE", ADAPTER_B)],
+}
+if C.SPEC_KHYPE:
+    DRIVERS.update(KHYPE_DRIVERS)
+
 WATCH: list[tuple[str, str]] = sorted({fa for legs in DRIVERS.values() for fa in legs})
 
 _lock = threading.Lock()

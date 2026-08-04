@@ -518,3 +518,73 @@ def test_log_push_tips_writes_jsonl_and_dedupes(monkeypatch, tmp_path):
         assert len(open(out).read().splitlines()) == 1
     finally:
         spec._tip_seen.clear()
+
+
+# --------------------------------------------------------------------------- kHYPE-семейство
+_KHYPE_FEED = "kHYPE_FUNDAMENTAL/USD"
+_PT_SEP = TOKENS["PT-kHYPE-24SEP2026"]["address"].lower()
+_BEHYPE = TOKENS["beHYPE"]["address"].lower()
+
+
+def test_drivers_cover_khype_family(caches):
+    """04.08 accessList-разбор: kHYPE — ОДИН самостоятельный фид (не композиция с HYPE),
+    beHYPE — композиция, PT-* — HYPE-приводные. Слепота предикта на ~$584k бонуса закрыта."""
+    assert spec.DRIVERS[_KHYPE] == [(_KHYPE_FEED, _A)]
+    assert sorted(spec.DRIVERS[_BEHYPE]) == sorted(
+        [("beHYPE_MAIN_FUNDAMENTAL", _A), ("HYPE", _A)])
+    assert spec.DRIVERS[_PT_SEP] == [("HYPE", _A)]
+    assert spec.DRIVERS[TOKENS["PT-kHYPE-19MAR2026"]["address"].lower()] == [("HYPE", spec.ADAPTER_B)]
+
+
+def test_plan_whype_debt_khype_collateral_does_not_self_cancel(caches):
+    """ЯДРО разбора: залог kHYPE ценится СВОИМ фидом, долг WHYPE — фидом HYPE. Пуш HYPE
+    переоценивает только долг ⇒ ралли HYPE роняет HF (замер 04.08: 35 tx с HYPE и 17 с kHYPE
+    за 6ч, общих НОЛЬ — ноги двигаются раздельно). До разбора эта пара была вне карты и
+    зондов не получала вовсе."""
+    now_ms = int(time.time() * 1000)
+    with spec._lock:
+        spec._gw["HYPE"] = _feed_cache("HYPE", 50.0 * 1.01, now_ms - 5_000)      # долг +1%
+        spec._gw[_KHYPE_FEED] = _feed_cache(_KHYPE_FEED, 51.0, now_ms - 5_000)   # залог на месте
+        spec._chain[(_A, "HYPE")] = {"value": int(50.0 * 1e8), "ts_ms": now_ms - 240_000}
+        spec._chain[(_A, _KHYPE_FEED)] = {"value": int(51.0 * 1e8), "ts_ms": now_ms - 60_000}
+    p = spec.plan(_acct(1.005), _t(_KHYPE, _WHYPE))
+    assert p is not None, "ралли HYPE обязано ронять HF пары kHYPE-залог/WHYPE-долг"
+    assert p["feeds"] == ["HYPE"] and p["adapter"] == _A
+    assert p["hf_est"] == pytest.approx(1.005 / 1.01, rel=1e-6)
+
+
+def test_plan_khype_collateral_drop_fires_on_own_feed(caches):
+    """Обратная нога: просадка самого kHYPE_FUNDAMENTAL/USD роняет залог (долг неподвижен)."""
+    now_ms = int(time.time() * 1000)
+    with spec._lock:
+        spec._gw[_KHYPE_FEED] = _feed_cache(_KHYPE_FEED, 49.0, now_ms - 5_000)   # −3.9%
+        spec._gw["HYPE"] = _feed_cache("HYPE", 50.0, now_ms - 5_000)
+        spec._chain[(_A, _KHYPE_FEED)] = {"value": int(51.0 * 1e8), "ts_ms": now_ms - 240_000}
+        spec._chain[(_A, "HYPE")] = {"value": int(50.0 * 1e8), "ts_ms": now_ms - 240_000}
+    p = spec.plan(_acct(1.01), _t(_KHYPE, _WHYPE))
+    assert p is not None and p["feeds"] == [_KHYPE_FEED]
+    assert p["hf_est"] == pytest.approx(1.01 * (49.0 / 51.0), rel=1e-6)
+
+
+def test_plan_pt_scales_by_hype_despite_pendle_discount(caches):
+    """PT-* читает слот HYPE + слот дисконта Pendle (RedStone его не пушит). plan() считает
+    МАСШТАБ, постоянный множитель дисконта в нём сокращается — замер дрейфа 0.0027% за 8ч
+    против порога девиации 0.5%, поэтому масштабирование по HYPE законно."""
+    now_ms = int(time.time() * 1000)
+    with spec._lock:
+        spec._gw["HYPE"] = _feed_cache("HYPE", 48.5, now_ms - 5_000)             # залог −3%
+        spec._gw["USDT"] = _feed_cache("USDT", 1.0, now_ms - 5_000)
+        spec._chain[(_A, "HYPE")] = {"value": int(50.0 * 1e8), "ts_ms": now_ms - 240_000}
+        spec._chain[(_A, "USDT")] = {"value": int(1.0 * 1e8), "ts_ms": now_ms - 240_000}
+    p = spec.plan(_acct(1.01), _t(_PT_SEP, _USDT0))
+    assert p is not None and p["feeds"] == ["HYPE"]
+    assert p["hf_est"] == pytest.approx(1.01 * 0.97, rel=1e-6)
+
+
+def test_plan_khype_against_khype_still_self_cancels(caches):
+    """Страховка от переусложнения: одинаковые ноги по-прежнему сокращаются и не стреляют."""
+    now_ms = int(time.time() * 1000)
+    with spec._lock:
+        spec._gw[_KHYPE_FEED] = _feed_cache(_KHYPE_FEED, 40.0, now_ms - 5_000)
+        spec._chain[(_A, _KHYPE_FEED)] = {"value": int(51.0 * 1e8), "ts_ms": now_ms - 240_000}
+    assert spec.plan(_acct(1.01), _t(_KHYPE, _KHYPE)) is None
