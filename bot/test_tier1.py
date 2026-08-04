@@ -516,15 +516,16 @@ def test_prearm_quotes_risk_rows_not_targets(prearm_env, capsys):
     assert "prearm:" in capsys.readouterr().out
 
 
-def test_prearm_skips_same_asset(prearm_env, capsys):
-    """Контракт свопает безусловно (swapTarget.call + revert), поэтому coll==debt не берём —
-    но отказ обязан быть ВИДИМЫМ, а не тихим."""
+def test_prearm_arms_same_asset(prearm_env, capsys):
+    """04.08 (контракт v2): coll==debt больше не фильтруется в prearm — строка идёт в evaluate
+    и армится как любая другая. Решение об отказе (HL_SAME_ASSET=0) живёт в _evaluate_one."""
     a = "0x" + "55" * 20
     row = {"borrower": "0xs", "hf": 1.001, "coll_sym": "WHYPE", "debt_sym": "WHYPE",
            "coll_asset": a, "debt_asset": a.upper(), "hf_1e18": int(1.001e18)}
     prearm_env.setattr(ex, "refine", lambda *a_, **k: ([], [row]))
+    prearm_env.setattr(ex, "_resize", lambda t, n, d: dict(t))
     prearm_env.setattr(ex, "evaluate",
-                       lambda t, g: (_ for _ in ()).throw(AssertionError("котировка на coll==debt")))
+                       lambda t, g: {"net_usd": 30.0, "profitable": True})
     ex._prearm_quote(None, {}, ["0xs"], {}, {}, 1.0)
-    assert "0xs" not in ex._prearm
-    assert "одинаковый актив" in capsys.readouterr().out
+    assert "0xs" in ex._prearm, "same-asset строка обязана армиться на v2"
+    assert "одинаковый актив" not in capsys.readouterr().out

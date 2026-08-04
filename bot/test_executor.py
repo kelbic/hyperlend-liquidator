@@ -78,6 +78,45 @@ def test_evaluate_uses_fee_adjusted_seized_and_pulled():
     assert ev["net_wei"] == 1630 * 10 ** 6 - ev["owed"]
 
 
+def _same_asset_target() -> dict:
+    a = "0x" + "aa" * 20
+    return {
+        "seized": 1_100 * 10 ** 6,                # 1100 USDT0 received (bonus baked in)
+        "debt_to_cover": 1_010 * 10 ** 6,
+        "debt_pulled": 1_000 * 10 ** 6,
+        "coll_asset": a, "debt_asset": a.upper(),  # case must not defeat the match
+        "coll_dec": 6, "debt_dec": 6, "debt_price": 100_000_000,
+    }
+
+
+def test_evaluate_same_asset_skips_the_swap_entirely(monkeypatch):
+    """coll==debt (контракт v2): выручка = seized, LiquidSwap не вызывается, swap_target нулевой."""
+    monkeypatch.setattr(liqd, "quote_for_seized",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("квота на coll==debt")))
+    ev = E.evaluate(_same_asset_target(), gas_usd=0.01)
+    assert ev["swap_target"] == "0x" + "00" * 20 and ev["swap_calldata"] == "0x"
+    assert ev["impact"] == 0.0
+    premium = (1_010 * 10 ** 6 * C.FLASH_PREMIUM_BPS + 9999) // 10000
+    assert ev["net_wei"] == 1_100 * 10 ** 6 - (1_000 * 10 ** 6 + premium)
+    assert ev["profitable"]
+
+
+def test_evaluate_same_asset_gated_off_is_a_visible_skip(monkeypatch):
+    """Откат на v1 (HL_SAME_ASSET=0): отказ обязан быть видимым skip'ом, не тихим None."""
+    monkeypatch.setattr(C, "SAME_ASSET", False)
+    ev = E.evaluate(_same_asset_target(), gas_usd=0.01)
+    assert "HL_SAME_ASSET=0" in ev["skip"]
+
+
+def test_encode_liquidate_zero_swap_target(monkeypatch):
+    """Кодировщик обязан переварить нулевой swapTarget + пустые bytes — боевой вид same-asset tx."""
+    monkeypatch.setattr(C, "CONTRACT", "0x" + "11" * 20)
+    t = dict(_T, coll_asset=_T["debt_asset"])
+    ev = dict(_EV, swap_target="0x" + "00" * 20, swap_calldata="0x")
+    cd = E._encode_liquidate(t, ev)
+    assert cd.startswith(E.LIQUIDATE_SELECTOR) and len(cd) % 2 == 0
+
+
 # ------------------------------------------------------------------- fire path: broadcast first
 _T = {"borrower": "0x" + "ab" * 20, "hf": 0.95, "close_factor": 1.0, "coll_sym": "WHYPE",
       "debt_sym": "USDC", "debt_to_cover": 1_000 * 10 ** 6, "coll_asset": "0x" + "c" * 40,

@@ -32,6 +32,11 @@ FLASH_PREMIUM_BPS = FLASHLOAN_PREMIUM_BPS
 # --- executor knobs (env-overridable) ----------------------------------------------------------
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"            # default: DO NOT send
 CONTRACT = os.environ.get("HL_CONTRACT", "")               # deployed HyperLendLiquidator (req to fire)
+# 04.08 («го на все»): в бою контракт v2 (0x5C20F458…) — пропускает своп при coll==debt. Этот флаг
+# открывает same-asset классу путь через бота (~$44k исторического бонуса был недостижим). ОТКАТ
+# HL_CONTRACT на v1 (0xCBAB63AA…) ОБЯЗАН сопровождаться HL_SAME_ASSET=0: v1 свопает безусловно,
+# и same-asset выстрел на нём ревертится (маршрута в себя не существует).
+SAME_ASSET = os.environ.get("HL_SAME_ASSET", "1") == "1"
 PRIVATE_KEY = os.environ.get("HL_PRIVATE_KEY", "")
 KEYFILE = os.path.expanduser(os.environ.get("HL_KEYFILE", "~/.hyperlend-bot/key"))
 if not PRIVATE_KEY and os.path.exists(KEYFILE):

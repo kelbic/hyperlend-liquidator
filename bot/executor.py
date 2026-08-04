@@ -470,13 +470,23 @@ def _evaluate_one(t: dict, gas_usd: float) -> dict | None:
     debt_pulled = t.get("debt_pulled", debt_to_cover)
     if seized <= 0 or debt_to_cover <= 0:
         return None
-    try:
-        q = liqd.quote_for_seized(t["coll_asset"], t["debt_asset"], seized,
-                                  t["coll_dec"], t["debt_dec"])
-    except liqd.NoRouteError:
-        return {"skip": "no LiquidSwap route (illiquid/exotic collateral)"}
-    except Exception as e:
-        return {"skip": f"quote error: {e}"}
+    if t["coll_asset"].lower() == t["debt_asset"].lower():
+        # coll == debt: залог И ЕСТЬ актив погашения — маршрута «в себя» не существует, своп не
+        # нужен. Выручка = seized напрямую (тот же токен и децималы), impact нулевой; контракт v2
+        # при совпадении активов пропускает своп (swapTarget шлём нулевым). На v1 такой выстрел
+        # ревертится — потому гейт на флаге, связанном с откатом контракта.
+        if not C.SAME_ASSET:
+            return {"skip": "coll==debt закрыт (HL_SAME_ASSET=0 — контракт v1 свопает безусловно)"}
+        q = {"swap_target": "0x" + "00" * 20, "swap_calldata": "0x",
+             "amount_out": seized, "price_impact": 0.0}
+    else:
+        try:
+            q = liqd.quote_for_seized(t["coll_asset"], t["debt_asset"], seized,
+                                      t["coll_dec"], t["debt_dec"])
+        except liqd.NoRouteError:
+            return {"skip": "no LiquidSwap route (illiquid/exotic collateral)"}
+        except Exception as e:
+            return {"skip": f"quote error: {e}"}
 
     proceeds = q["amount_out"]                                   # debt-asset wei out of the swap
     # what the liquidation consumes: the ACTUAL pull (<= debt_to_cover) + the flash premium
@@ -1168,10 +1178,8 @@ def _prearm_quote(rpc: Rpc, book: dict, borrowers: list[str], accounts: dict,
                          min_debt_usd=C.MIN_DEBT_USD, watch_hf=C.PREARM_HF,
                          report_hf=C.PREARM_HF, retries=1)
         for t in risk:
-            if t["coll_asset"].lower() == t["debt_asset"].lower():
-                # своп в тот же актив маршрута не имеет, а контракт свопает безусловно
-                skipped.append(f"{t['borrower'][:10]}…:одинаковый актив")
-                continue
+            # coll==debt больше НЕ фильтруется здесь: контракт v2 пропускает своп, а решение
+            # (и видимый отказ при HL_SAME_ASSET=0) принадлежит evaluate/_evaluate_one.
             hyp = dict(t, hf_1e18=int(0.999e18))
             shaved = _resize(hyp, *C.PREARM_SHAVE) or hyp
             ev = evaluate(shaved, gas_usd)
