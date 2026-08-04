@@ -87,6 +87,7 @@ sys.path.insert(0, REPO)
 from bot import config as C                                    # noqa: E402
 from bot import liqd                                           # noqa: E402
 from bot import shadow                                         # noqa: E402
+from bot import spec                                           # noqa: E402
 from analysis.aave import (                                    # noqa: E402
     HF_INFINITY, SEL_GET_USER_ACCOUNT_DATA, decode_user_account_data, size_liquidation,
 )
@@ -102,6 +103,13 @@ LIQUIDATE_SIG = "liquidate(address,address,address,uint256,bool,address,bytes,ui
 # canonical signature, which the byte-equality test against `cast calldata` would catch.
 LIQUIDATE_TYPES = LIQUIDATE_SIG[LIQUIDATE_SIG.index("(") + 1:-1].split(",")
 LIQUIDATE_SELECTOR = "0x" + keccak(text=LIQUIDATE_SIG)[:4].hex()   # 0x3c78a656
+
+# Контракт v2 (04.08): пуш подписанной RedStone-цены в адаптер + ликвидация одной транзакцией —
+# спекулятивный путь (см. _spec_pass). Типы/селектор дериватся из строки по тому же правилу.
+PUSH_SIG = ("liquidateWithPush(address,bytes,address,address,address,"
+            "uint256,bool,address,bytes,uint256)")
+PUSH_TYPES = PUSH_SIG[PUSH_SIG.index("(") + 1:-1].split(",")
+PUSH_SELECTOR = "0x" + keccak(text=PUSH_SIG)[:4].hex()
 
 
 # --------------------------------------------------------------------------- state / guards
@@ -729,6 +737,27 @@ def _encode_liquidate(t: dict, ev: dict) -> str:
     return LIQUIDATE_SELECTOR + abi_encode(LIQUIDATE_TYPES, values).hex()
 
 
+def _encode_liquidate_push(t: dict, ev: dict, oracle_target: str, oracle_calldata: bytes) -> str:
+    """liquidateWithPush(...) calldata: те же аргументы, что _encode_liquidate, плюс адаптер и
+    сырой RedStone-payload первой парой. Кодируется тем же правилом (типы из строки сигнатуры),
+    байт-тест против `cast calldata` — в bot/test_executor.py."""
+    cd = ev["swap_calldata"] or "0x"
+    raw = cd[2:] if cd[:2].lower() == "0x" else cd
+    values = [
+        to_checksum_address(oracle_target),
+        bytes(oracle_calldata),
+        to_checksum_address(t["coll_asset"]),
+        to_checksum_address(t["debt_asset"]),
+        to_checksum_address(t["borrower"]),
+        int(ev["debt_to_cover"]),
+        bool(C.USE_FLASHLOAN),
+        to_checksum_address(ev["swap_target"]),
+        bytes.fromhex(raw),
+        int(ev["min_profit_wei"]),
+    ]
+    return PUSH_SELECTOR + abi_encode(PUSH_TYPES, values).hex()
+
+
 class SendAmbiguous(RuntimeError):
     """The broadcast outcome is UNKNOWN: the request went out and the answer never came back.
 
@@ -867,30 +896,40 @@ def _sign_args() -> list[str]:
     return ["--private-key", C.PRIVATE_KEY]
 
 
-def fire(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -> None:
+def fire(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
+         push: tuple[str, bytes] | None = None) -> None:
+    """push=(adapter, oracleCalldata) переключает вход контракта на liquidateWithPush —
+    спекулятивный выстрел по свежей подписанной цене (см. _spec_pass). Доступен только на
+    raw-пути: у cast-фолбэка нет формы для bytes-аргумента такого размера, и spec-проход
+    гейтится на C.RAW_TX — здесь пуш молча не теряем, а роняем выстрел с явной причиной."""
     key = t["borrower"]
     nets = f"${ev['net_usd']:+,.1f}"
-    hdr = (f"HF={t['hf']:.4f} cf={t['close_factor']:.0%} {t['coll_sym']}->{t['debt_sym']} "
+    hdr = (f"{'PUSH ' if push else ''}HF={t['hf']:.4f} cf={t['close_factor']:.0%} "
+           f"{t['coll_sym']}->{t['debt_sym']} "
            f"cover={t['debt_to_cover']} net={nets} impact={ev['impact']*100:.2f}% "
            f"{t['borrower'][:10]}…")
     if C.DRY_RUN or not C.CONTRACT:
         print(f"  DRY_RUN: would liquidate {hdr}; guard=DRY, NOT sent "
               f"(contract={'set' if C.CONTRACT else 'none'})")
         return
+    if push and not C.RAW_TX:
+        print(f"  spec: пуш требует HL_RAW_TX=1 — выстрел {key[:10]}… отменён")
+        return
     if C.RAW_TX:
-        _fire_raw(t, ev, st, now_ts, gas_usd, key, hdr)
+        _fire_raw(t, ev, st, now_ts, gas_usd, key, hdr, push)
     else:
         _fire_cast(t, ev, st, now_ts, gas_usd, key, hdr)
 
 
 def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
-              key: str, hdr: str) -> None:
+              key: str, hdr: str, push: tuple[str, bytes] | None = None) -> None:
     """HL_RAW_TX=1: encode -> sign -> broadcast -> RETURN. No receipt wait, ever. The tx is filed
     as "pending" and settled by _check_pending() on a later pass, so the next target in a cascade
     is evaluated immediately instead of ~4.4s later."""
     maybe = ""
     try:
-        calldata = _encode_liquidate(t, ev)
+        calldata = (_encode_liquidate_push(t, ev, *push) if push
+                    else _encode_liquidate(t, ev))
         txh = _sign_and_send(calldata, tip_wei=_tip_wei(ev.get("net_usd"), st))
     except SendAmbiguous as e:
         # DELIVERY UNKNOWN — book it exactly like a successful send. A tx we cannot rule out is
@@ -1283,6 +1322,55 @@ def process_targets(rpc: Rpc, targets: list, st: dict, now_ts: float, gas_usd: f
     return fired
 
 
+_spec_stale_warn = {"ts": 0.0}
+
+
+def _spec_pass(accounts: dict, st: dict, now_ts: float, gas_usd: float) -> int:
+    """Спекулятивный проход (04.08): армленные цели у кромки, у которых свежая ПОДПИСАННАЯ
+    цена гейтвея даёт HF_est < C.SPEC_HF_FIRE, стреляются через liquidateWithPush — пуш этой
+    самой цены и ликвидация одной транзакцией (lag=0, техника единственного оператора тихого
+    поля). On-chain HF >= 1 обязателен: HF < 1 берёт реактивный путь этой же итерации, и пуш
+    там способен «вылечить» жертву нашей же свежей ценой. Промах оценки стоит одного реверта
+    (HF-чек liquidationCall + on-chain min_profit) и учитывается kill-switch'ем как любой
+    промах; повторы душит recently_fired (pending -> DEDUP/REVERT_COOLDOWN)."""
+    if not (C.SPEC_FIRE and C.RAW_TX and C.CONTRACT):
+        return 0
+    with _prearm_lock:
+        armed = list(_prearm.items())
+    if armed:
+        msg = spec.staleness()
+        if msg and time.monotonic() - _spec_stale_warn["ts"] > 300:
+            _spec_stale_warn["ts"] = time.monotonic()
+            print(f"  ⚠️ spec {msg} — кромка армлена, спекулятивный слой слеп")
+    n = 0
+    for b, rec in armed:
+        acct = accounts.get(b)
+        if acct is None or time.monotonic() - rec["ts"] > C.PREARM_TTL:
+            continue
+        hf = acct["health_factor"] / 1e18
+        if not (1.0 <= hf < C.PREARM_HF):
+            continue
+        if recently_fired(st, b, now_ts):
+            continue
+        p = spec.plan(acct, rec["t"])
+        if p is None:
+            continue
+        try:
+            cd = spec.push_calldata(p)
+        except Exception as e:          # noqa: BLE001 — битый payload не смеет ронять итерацию
+            print(f"  spec payload {b[:10]}…: {e}")
+            continue
+        print(f"  🎯 SPEC {b[:10]}… HF={hf:.4f} est={p['hf_est']:.4f} "
+              f"push {'+'.join(p['feeds'])}@{p['adapter'][:10]}… age={p['age_ms']/1000:.1f}s")
+        if not C.DRY_RUN and not check_balance(st, now_ts, force=True):
+            print(f"  spec skip {b[:10]}… — недостаточно газа на EOA (см. ⛽-алерт)")
+            break
+        fire(rec["t"], rec["ev"], st, now_ts, gas_usd, push=(p["adapter"], cd))
+        _prearm_drop(b)     # использованный арм не смеет пережить свой выстрел
+        n += 1
+    return n
+
+
 # --------------------------------------------------------------------------- pass / loop
 def once(st: dict | None = None, book: dict | None = None) -> int:
     own = st is None
@@ -1378,6 +1466,17 @@ def _hot_iteration(rpc: Rpc, book: dict, st: dict, hs: dict, gas_usd: float,
                                 retries=1)
         fired = process_targets(rpc, targets, st, now_ts, gas_usd)
 
+    # spec-fire ПОСЛЕ реактивного прохода: живые HF<1 уже отработаны, теперь кромка.
+    # Спекулятивно выстреленные из hot-set НЕ выпадают: on-chain они ещё HF>=1, и если наш
+    # пуш-tx не долетит, реактивный путь обязан их видеть; повторы душит recently_fired.
+    spec_n = 0
+    if C.SPEC_FIRE and (ok or C.DRY_RUN):
+        try:
+            spec_n = _spec_pass(accounts, st, now_ts, gas_usd)
+        except Exception as e:          # noqa: BLE001 — spec не смеет ронять итерацию
+            print(f"  spec pass err: {e}")
+    spec.set_hot(bool(_prearm))     # каденс вотчера: кромка армлена => кэш держим тёплым
+
     hot = update_hotset(hot, accounts, C.HOT_HF, C.MIN_DEBT_USD, drop=set(fired))
     hs["cursor"] = new_cursor
     hs["hot"] = sorted(hot)
@@ -1392,7 +1491,7 @@ def _hot_iteration(rpc: Rpc, book: dict, st: dict, hs: dict, gas_usd: float,
     hfs = [a["health_factor"] / 1e18 for a in accounts.values() if a["health_factor"] < HF_INFINITY]
     return {"n_read": len(accounts), "n_hot": len(hot), "n_targets": len(tgt_borrowers),
             "fired": len(fired), "cursor": new_cursor, "wrapped": wrapped, "chunk": len(chunk),
-            "oracle_upd": n_upd,
+            "oracle_upd": n_upd, "spec": spec_n,
             "n_book": len(borrowers), "min_hf": min(hfs) if hfs else None,
             "guard_ok": ok, "reason": reason}
 
@@ -1435,6 +1534,8 @@ def _log_iter(status: dict, dt: float) -> None:
     g = "OK" if status.get("guard_ok") else f"STOP({status.get('reason')})"
     fired = status.get("fired", 0)
     fired_s = f" fired {fired}" if fired else ""
+    if status.get("spec"):
+        fired_s += f" spec {status['spec']}"
     print(f"[{ts}] hot-set: read {status['n_read']} | hot {status['n_hot']} | "
           f"tgt {status['n_targets']}{fired_s} | sweep {cur}/{nb} ({pct:.0f}%) | "
           f"minHF {mh_s} | {dt:.1f}s | guard={g} "
@@ -1497,6 +1598,10 @@ def loop() -> None:
               slow_sec=C.RPC_SLOW_SEC)
     reserves_cfg = load_reserves(rpc, book)   # cached in book; no RPC if already present
     save_book(book)
+    # spec-вотчер (гейтвей + chain-кэш) греется с самого старта: первый транзит после
+    # рестарта не должен заставать кэш холодным. Гейтится теми же условиями, что и выстрел.
+    if C.SPEC_FIRE and C.RAW_TX and C.CONTRACT:
+        spec.start()
     banner = (f"▶️ hyperlend executor started (DRY_RUN={'on' if C.DRY_RUN else 'OFF'}, "
               f"path={'flash' if C.USE_FLASHLOAN else 'capital'}, min_profit ${C.MIN_PROFIT_USD}, "
               f"contract={'set' if C.CONTRACT else 'NONE'}, hot-set HF<{C.HOT_HF} "

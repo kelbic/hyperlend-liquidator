@@ -439,6 +439,89 @@ def test_encode_liquidate_accepts_lowercase_and_checksummed_addresses_alike():
     assert E._encode_liquidate(lower, _ENC_EV) == E._encode_liquidate(upper, _ENC_EV)
 
 
+# --------------------------------------------------- liquidateWithPush (spec-fire, 04.08)
+_PUSH_ORACLE = "0x" + "a1" * 20
+# RedStone-payload произвольной (не кратной 32) длины — энкодер обязан дополнить хвост
+_PUSH_CD = bytes.fromhex("b7a16251") + bytes(range(45))
+
+
+def test_liquidate_push_selector_is_derived_not_pasted():
+    from eth_utils import keccak
+    assert E.PUSH_SELECTOR == "0x" + keccak(text=E.PUSH_SIG)[:4].hex()
+    assert E.PUSH_TYPES == ["address", "bytes", "address", "address", "address",
+                            "uint256", "bool", "address", "bytes", "uint256"]
+
+
+def test_encode_liquidate_push_matches_cast_calldata_byte_for_byte():
+    """Тот же класс гарантии, что у _encode_liquidate: спекулятивный выстрел не имеет права
+    зависеть от невидимой разницы кодирования — сверка с `cast calldata` на тех же кейсах
+    плюс oracle-пара (пустой и некратный 32 payload)."""
+    import shutil
+    import subprocess as sp
+    import unittest
+    cast = shutil.which("cast")
+    if not cast:
+        raise unittest.SkipTest("foundry `cast` not on PATH — cannot cross-check the encoding")
+    o_flash = C.USE_FLASHLOAN
+    try:
+        for flash in (True, False):
+            C.USE_FLASHLOAN = flash
+            for oracle_cd in (b"", _PUSH_CD):
+                for name, t, ev in _ENC_CASES:
+                    mine = E._encode_liquidate_push(t, ev, _PUSH_ORACLE, oracle_cd)
+                    ref = sp.run(
+                        [cast, "calldata", E.PUSH_SIG, _PUSH_ORACLE,
+                         "0x" + oracle_cd.hex(), t["coll_asset"], t["debt_asset"],
+                         t["borrower"], str(ev["debt_to_cover"]),
+                         "true" if flash else "false", ev["swap_target"],
+                         ev["swap_calldata"], str(ev["min_profit_wei"])],
+                        capture_output=True, text=True, timeout=60)
+                    assert ref.returncode == 0, f"cast failed on {name}: {ref.stderr}"
+                    assert mine.lower() == ref.stdout.strip().lower(), (
+                        f"push calldata mismatch [{name}, flash={flash}, "
+                        f"oracle_cd={len(oracle_cd)}B]\n  ours: {mine}\n  cast: "
+                        f"{ref.stdout.strip()}")
+    finally:
+        C.USE_FLASHLOAN = o_flash
+
+
+def test_fire_raw_with_push_sends_push_calldata_and_books_identically():
+    """fire(push=...) обязан слать liquidateWithPush-калдату, а бронирование (pending/fires/
+    газ) быть бит-в-бит с обычным выстрелом — spec-промах проходит тот же kill-switch-учёт."""
+    sent = {}
+    o = _armed_raw(_FakeWrite())
+    o_sign = E._sign_and_send
+    E._sign_and_send = lambda cd, tip_wei=None: sent.setdefault("cd", cd) or "0x" + "f" * 64
+    st = _fresh_state()
+    try:
+        E.fire(dict(_T), dict(_EV), st, 1_000_000.0, 0.01, push=(_PUSH_ORACLE, _PUSH_CD))
+    finally:
+        E._sign_and_send = o_sign
+        _restore_raw(o)
+    assert sent["cd"].startswith(E.PUSH_SELECTOR), "с пушем шлётся liquidateWithPush"
+    assert sent["cd"] == E._encode_liquidate_push(_T, _EV, _PUSH_ORACLE, _PUSH_CD)
+    rec = st["sent"][_T["borrower"]]
+    assert rec["status"] == "pending" and st["fires"] == 1 and st["gas_usd"] == 0.01
+
+
+def test_fire_with_push_refuses_cast_path():
+    """Пуш существует только на raw-пути: на cast-фолбэке выстрел с пушем РОНЯЕТСЯ с явной
+    причиной, а не молча уходит без пуша (тихая потеря пуша = спекулятивный реверт)."""
+    o = _armed_raw(_FakeWrite())
+    C.RAW_TX = False
+    ran = []
+    o_run = E.subprocess.run
+    E.subprocess.run = lambda *a, **kw: ran.append(a) or _CastOk()
+    st = _fresh_state()
+    try:
+        E.fire(dict(_T), dict(_EV), st, 1_000_000.0, 0.01, push=(_PUSH_ORACLE, _PUSH_CD))
+    finally:
+        E.subprocess.run = o_run
+        _restore_raw(o)
+    assert not ran, "cast не должен запускаться"
+    assert st["fires"] == 0 and not st["sent"], "выстрел отменён целиком"
+
+
 # ------------------------------------------------------------------- sign + broadcast
 _TEST_KEY = "0x" + "11" * 32
 _TEST_CONTRACT = "0x" + "1" * 40

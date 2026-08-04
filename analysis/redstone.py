@@ -20,6 +20,7 @@ the operator's EOA (not a relayer) and by our own eth_call.
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import time
 import urllib.request
@@ -53,9 +54,28 @@ class RedstoneError(RuntimeError):
 
 
 def _http_get_json(url: str, timeout: float) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0"})
+    # gzip: гейтвей отдаёт полный снапшот всех фидов (~1.7MB), сжатие режет его до ~350KB —
+    # на каденсе spec-вотчера это разница между 15 и 3 GB/день трафика VPS.
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0",
+                                               "Accept-Encoding": "gzip"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+        raw = r.read()
+        if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+            raw = gzip.decompress(raw)
+        return json.loads(raw)
+
+
+def fetch_latest_all(timeout: float = 3.0) -> dict:
+    """Один GET = весь снапшот redstone-primary-prod (фильтр-параметры гейтвей игнорирует —
+    проверено 04.08, dataFeedIds в query не сужает ответ). Кормит кэш bot/spec.py; для
+    разовых нужд одного фида есть fetch_feed_packages."""
+    last_err: Exception | None = None
+    for gw in GATEWAYS:
+        try:
+            return _http_get_json(gw, timeout)
+        except Exception as e:
+            last_err = e
+    raise RedstoneError(f"all gateways failed: {last_err}")
 
 
 def _recover_signer(body: bytes, sig: bytes) -> str | None:
@@ -138,17 +158,23 @@ def fetch_feed_packages(feed_id: str, timeout: float = 1.5,
     raise RedstoneError(f"all gateways failed for {feed_id}: {last_err}")
 
 
-def build_push_calldata(feed_ids: list[str], packages: list[dict]) -> bytes:
+def build_push_calldata(feed_ids: list[str], packages: list[dict],
+                        require_signers: bool = True) -> bytes:
     """Full calldata for adapter.updateDataFeedsValuesPartial(bytes32[]) with the RedStone payload
     appended — ready to be sent to the adapter proxy (or handed to the liquidator contract as
-    `oracleCalldata`)."""
+    `oracleCalldata`).
+
+    require_signers=False ОБЯЗАТЕЛЕН для мульти-фидового пуша с ПРЕДВАРИТЕЛЬНО проверенными
+    пакетами: build_payload считает unique-подписантов на весь payload, а каждый фид подписан
+    одними и теми же пятью нодами — строгий режим выбросил бы все пакеты второго фида и пуш
+    ревертнулся бы порогом адаптера (он считает порог пер-фид сам)."""
     ids = [f.encode().ljust(32, b"\0") for f in feed_ids]
     if any(len(f.encode()) > 32 for f in feed_ids):
         raise RedstoneError("feed id longer than 32 bytes")
     head = bytes.fromhex(SEL_UPDATE_PARTIAL[2:])
     # abi: offset(32) + len(32) + ids
     abi = (32).to_bytes(32, "big") + len(ids).to_bytes(32, "big") + b"".join(ids)
-    return head + abi + build_payload(packages)
+    return head + abi + build_payload(packages, require_signers=require_signers)
 
 
 def latest_price(feed_id: str, timeout: float = 1.5) -> tuple[float, int]:

@@ -193,6 +193,29 @@ PREARM_REFRESH_SEC = float(os.environ.get("HL_PREARM_REFRESH_SEC", "20"))
 PREARM_MAX = int(os.environ.get("HL_PREARM_MAX", "2"))
 PREARM_SHAVE = (97, 100)
 
+# --- SPEC-FIRE: атомарный self-push + ликвидация (контракт v2 liquidateWithPush) -----------
+# Тихое поле = ОДИН оператор, и ВСЕ его победы lag=0: он сам пушит подписанный RedStone-payload
+# в адаптер и ликвидирует в той же tx (разбор гонки 04.08). Реактивный контур проигрывает ему
+# структурно — триггер срабатывает, когда добыча уже взята тем же блоком. Паритет: армленная
+# цель у кромки (1.0 <= HF < PREARM_HF), у которой СВЕЖАЯ подписанная цена гейтвея даёт
+# HF_est < SPEC_HF_FIRE, стреляется через liquidateWithPush — пуш этой самой цены и ликвидация
+# в одной транзакции. К РЕАКТИВНЫМ выстрелам (on-chain HF<1) пуш НЕ цепляется: свежая цена там
+# способна «вылечить» жертву и сорвать наш же выстрел. Промах оценки стоит одного реверта
+# (гейты контракта: HF-чек liquidationCall + min_profit) и учитывается kill-switch'ем.
+# Карта актив->фиды и оба кэша (гейтвей + getLastUpdateDetails) живут в bot/spec.py.
+# ОТКАТ: HL_SPEC_FIRE=0 — реактивный путь не меняется вовсе.
+SPEC_FIRE = os.environ.get("HL_SPEC_FIRE", "1") == "1"
+# Порог по оценочному HF: запас 0.2% на дрейф долей позиции и погрешность масштабирования
+# (непокрытый остаток позиции считается неподвижным — формула в bot/spec.py).
+SPEC_HF_FIRE = float(os.environ.get("HL_SPEC_HF_FIRE", "0.998"))
+# Максимальный возраст подписанного пакета: адаптер терпит ~3 мин, но старый пакет = старая
+# цена = оценка по ней уже не «свежее рынка» — 30с с запасом кроет каденс вотчера.
+SPEC_MAX_AGE_MS = int(os.environ.get("HL_SPEC_MAX_AGE_MS", "30000"))
+# Каденс вотчера: hot — у кромки есть армленные цели (кэш обязан быть тёплым к транзиту),
+# cold — кромка пуста, кэш греется вполсилы (полный снапшот гейтвея ~350KB gzip за тик).
+SPEC_POLL_HOT = float(os.environ.get("HL_SPEC_POLL_HOT", "1.5"))
+SPEC_POLL_COLD = float(os.environ.get("HL_SPEC_POLL_COLD", "10"))
+
 STATE_FILE = os.path.expanduser(os.environ.get("HL_STATE", "~/.hyperlend-bot/state.json"))
 LOCK_FILE = os.path.expanduser(os.environ.get("HL_LOCK", "~/.hyperlend-bot/executor.lock"))
 
