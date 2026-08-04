@@ -367,3 +367,130 @@ def test_shadow_decode_fields():
 def test_shadow_disabled_is_noop(shadow_env):
     shadow_env.setattr(C, "SHADOW", False)
     shadow.tick(None, {}, {}, {})            # None-rpc: упал бы, если бы не откат-гард
+
+
+# --------------------------------------------------------------------------- oracle-update trigger
+class _UpdRpc:
+    def __init__(self, head, logs):
+        self.head, self.logs, self.calls = head, logs, []
+
+    def block_number(self):
+        self.calls.append("head")
+        return self.head
+
+    def get_logs(self, address, topics, frm, to):
+        self.calls.append(("logs", frm, to))
+        return [l for l in self.logs if frm <= l["_blk"] <= to]
+
+
+def _upd_log(blk):
+    return {"_blk": blk, "blockNumber": hex(blk)}
+
+
+@pytest.fixture
+def upd_env(monkeypatch):
+    monkeypatch.setattr(C, "UPDATE_TRIGGER", True)
+    monkeypatch.setattr(ex, "_upd_watch", {"from": None})
+    return monkeypatch
+
+
+def test_upd_first_call_inits_cursor_returns_zero(upd_env):
+    r = _UpdRpc(100, [_upd_log(99)])
+    assert ex.poll_oracle_updates(r) == 0
+    assert ex._upd_watch["from"] == 101, "старые события до старта не считаются"
+
+
+def test_upd_new_events_advance_cursor(upd_env):
+    r = _UpdRpc(100, [])
+    ex.poll_oracle_updates(r)                       # init: from=101
+    r.head, r.logs = 110, [_upd_log(105), _upd_log(108)]
+    assert ex.poll_oracle_updates(r) == 2
+    assert ex._upd_watch["from"] == 109
+    r.head = 115
+    assert ex.poll_oracle_updates(r) == 0, "те же события не считаются дважды"
+
+
+def test_upd_read_error_returns_zero(upd_env):
+    class Boom:
+        def block_number(self):
+            raise TimeoutError("storm")
+    ex._upd_watch["from"] = 50
+    class Boom2:
+        def block_number(self):
+            return 60
+        def get_logs(self, *a):
+            raise TimeoutError("storm")
+    assert ex.poll_oracle_updates(Boom()) == 0
+    assert ex.poll_oracle_updates(Boom2()) == 0, "отказ триггера не смеет ронять итерацию"
+
+
+def test_upd_disabled_is_noop(upd_env):
+    upd_env.setattr(C, "UPDATE_TRIGGER", False)
+    assert ex.poll_oracle_updates(None) == 0        # None-rpc: упал бы без откат-гарда
+
+
+# --------------------------------------------------------------------------- pre-arm
+@pytest.fixture
+def prearm_env(monkeypatch):
+    monkeypatch.setattr(C, "PREARM", True)
+    monkeypatch.setattr(C, "PREARM_HF", 1.02)
+    monkeypatch.setattr(C, "PREARM_TTL", 45.0)
+    monkeypatch.setattr(C, "PREARM_REFRESH_SEC", 20.0)
+    monkeypatch.setattr(C, "PREARM_MAX", 2)
+    monkeypatch.setattr(ex, "_prearm", {})
+    ex._prearm_busy.clear()
+    return monkeypatch
+
+
+def test_prearm_get_respects_ttl_and_cf_regime(prearm_env):
+    ex._prearm["0xb"] = {"t": {"x": 1}, "ev": {"y": 2}, "ts": time.monotonic()}
+    assert ex._prearm_get("0xb", 0.99) == ({"x": 1}, {"y": 2})
+    assert ex._prearm_get("0xb", 0.90) is None, "HF<0.95 = другой close-factor, кэш не годится"
+    ex._prearm["0xold"] = {"t": {}, "ev": {}, "ts": time.monotonic() - 100}
+    assert ex._prearm_get("0xold", 0.99) is None, "протухший арм обязан отвергнуться"
+    assert "0xold" not in ex._prearm, "и удалиться"
+
+
+def test_prearm_tick_picks_edge_only(prearm_env):
+    from analysis.aave import HF_INFINITY as INF
+    from analysis.protocols import ORACLE_BASE_UNIT as OBU
+    prearm_env.setattr(C, "CONTRACT", "0xc")
+    prearm_env.setattr(C, "MIN_DEBT_USD", 500.0)
+    accounts = {
+        "0xedge":  {"health_factor": int(1.01e18), "total_debt_base": int(9_000 * OBU)},
+        "0xlive":  {"health_factor": int(0.99e18), "total_debt_base": int(9_000 * OBU)},  # HF<1: боевой путь
+        "0xfar":   {"health_factor": int(1.20e18), "total_debt_base": int(9_000 * OBU)},
+        "0xdust":  {"health_factor": int(1.01e18), "total_debt_base": int(10 * OBU)},
+        "0xinf":   {"health_factor": INF,          "total_debt_base": int(9_000 * OBU)},
+    }
+    spawned = []
+    prearm_env.setattr(ex.threading, "Thread",
+                       lambda target, args, daemon: spawned.append(args) or
+                       type("T", (), {"start": lambda self: None})())
+    ex.prearm_tick(None, {}, accounts, {}, 1.0)
+    assert len(spawned) == 1
+    assert spawned[0][2] == ["0xedge"], f"в кромку попал лишний: {spawned[0][2]}"
+
+
+def test_prearm_tick_single_flight(prearm_env):
+    prearm_env.setattr(C, "CONTRACT", "0xc")
+    ex._prearm_busy.set()                            # фоновый поток уже котирует
+    prearm_env.setattr(ex.threading, "Thread",
+                       lambda *a, **k: (_ for _ in ()).throw(AssertionError("второй поток")))
+    ex.prearm_tick(None, {}, {}, {}, 1.0)            # не должен спавнить
+
+
+def test_process_targets_uses_armed_quote(prearm_env):
+    """Арм-хит: evaluate (1.7-3.5с квота) НЕ вызывается, выстрел идёт с кэшем."""
+    prearm_env.setattr(C, "DRY_RUN", True)           # fire печатает и выходит — сеть не нужна
+    prearm_env.setattr(ex, "fresh_hf", lambda rpc, b: 0.98)
+    prearm_env.setattr(ex, "evaluate",
+                       lambda t, g: (_ for _ in ()).throw(AssertionError("квота на арм-хите")))
+    t_cached = {"borrower": "0xb", "hf": 0.99, "close_factor": 0.5, "coll_sym": "UBTC",
+                "debt_sym": "USDC", "debt_to_cover": 1, "repaid_usd": 100.0}
+    ev_cached = {"net_usd": 42.0, "impact": 0.001, "profitable": True,
+                 "debt_to_cover": 1, "min_profit_wei": 1}
+    ex._prearm["0xb"] = {"t": t_cached, "ev": ev_cached, "ts": time.monotonic()}
+    st = {"sent": {}, "fires": 0, "gas_usd": 0.0, "day": "2026-08-04"}
+    fired = ex.process_targets(None, [dict(t_cached, net_bonus_usd=50.0)], st, 1000.0, 1.0)
+    assert fired == ["0xb"]

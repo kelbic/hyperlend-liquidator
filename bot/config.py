@@ -157,6 +157,32 @@ SHADOW_EVERY_SEC = float(os.environ.get("HL_SHADOW_EVERY_SEC", "60"))
 SHADOW_FILE = os.environ.get("HL_SHADOW_FILE", os.path.join(DATA_DIR, "shadow_races.jsonl"))
 SHADOW_CKPT = os.environ.get("HL_SHADOW_CKPT", os.path.join(DATA_DIR, "shadow_ckpt.json"))
 
+# --- каденс после апдейта (04.08, после поправки 4237b15: поле берёт добычу через ~17с
+# ПОСЛЕ апдейта цены — гонка решается скоростью обнаружения в этом окне, не спекуляцией) ---
+# Событийный триггер: цикл слушает ValueUpdate обоих RedStone-адаптеров (1 дешёвый getLogs
+# на итерацию, ~25мс на drpc-keep-alive); апдейт => немедленный hot-only проход без сна.
+# ОТКАТ: HL_UPDATE_TRIGGER=0.
+UPDATE_TRIGGER = os.environ.get("HL_UPDATE_TRIGGER", "1") == "1"
+ORACLE_ADAPTERS = [a.strip() for a in os.environ.get(
+    "HL_ORACLE_ADAPTERS",
+    # 0xe4ae… = HYPE/BTC/USDT (+kHYPE_FUNDAMENTAL), 0x24c8… = ETH; связь доказана
+    # getPriceFeedAdapter() у фасадов (STATE 04.08, поправка)
+    "0xe4ae88743c3834d0c492eabc47384c84bcadc6a6,"
+    "0x24c8964338deb5204b096039147b8e8c3aea42cc").split(",") if a.strip()]
+TOPIC_VALUE_UPDATE = "0xf36866d965ee70c8632ff558f5cf8d41ee9ca1d0d0bc7700786e57be60747390"
+# Pre-arm: для кромки hot-set (1.0 <= HF < PREARM_HF) выход котируется ЗАРАНЕЕ фоном; при
+# пересечении HF<1 выстрел берёт кэш и не платит 1.7-3.5с LiquidSwap-квоты в горячий момент.
+# Размер бронируется с бритьём PREARM_SHAVE (котировка на 97% от расчётного cover: дрейф
+# позиции за TTL не должен опустить фактический seize ниже amountIn свопа — иначе реверт).
+# Кэш применяется только при HF >= 0.95 (тот же close-factor режим, что при котировке).
+# ОТКАТ: HL_PREARM=0.
+PREARM = os.environ.get("HL_PREARM", "1") == "1"
+PREARM_HF = float(os.environ.get("HL_PREARM_HF", "1.02"))
+PREARM_TTL = float(os.environ.get("HL_PREARM_TTL", "45"))
+PREARM_REFRESH_SEC = float(os.environ.get("HL_PREARM_REFRESH_SEC", "20"))
+PREARM_MAX = int(os.environ.get("HL_PREARM_MAX", "2"))
+PREARM_SHAVE = (97, 100)
+
 STATE_FILE = os.path.expanduser(os.environ.get("HL_STATE", "~/.hyperlend-bot/state.json"))
 LOCK_FILE = os.path.expanduser(os.environ.get("HL_LOCK", "~/.hyperlend-bot/executor.lock"))
 

@@ -1090,6 +1090,109 @@ def _check_pending(rpc: Rpc, st: dict, now_ts: float) -> None:
 
 
 # --------------------------------------------------------------------------- target processing
+# --------------------------------------------------------------------------- oracle-update trigger
+# 04.08 (поправка 4237b15): добыча берётся полем через ~17с ПОСЛЕ ValueUpdate — окно наше,
+# если обнаружение событийное. Один getLogs по двум адаптерам за итерацию; курсор двигают
+# только сами события (пустой ответ не трогает from — повторный запрос идемпотентен).
+_upd_watch: dict = {"from": None}
+
+
+def poll_oracle_updates(rpc: Rpc) -> int:
+    """Сколько НОВЫХ ValueUpdate с прошлого опроса. Ошибка чтения = 0 (триггер — ускоритель,
+    его отказ не смеет ронять итерацию: штатный опрос горячих никуда не девается)."""
+    if not C.UPDATE_TRIGGER:
+        return 0
+    try:
+        if _upd_watch["from"] is None:
+            _upd_watch["from"] = rpc.block_number() + 1
+            return 0
+        logs = rpc.get_logs(C.ORACLE_ADAPTERS, [C.TOPIC_VALUE_UPDATE],
+                            _upd_watch["from"], rpc.block_number())
+        if logs:
+            _upd_watch["from"] = max(int(l["blockNumber"], 16) for l in logs) + 1
+        return len(logs)
+    except Exception:
+        return 0
+
+
+# --------------------------------------------------------------------------- pre-arm
+# Кромка hot-set котируется фоном, выстрел берёт готовый (t, ev) из кэша — LiquidSwap-квота
+# (1.7-3.5с замер 30.07) уходит с горячего пути. Один фоновый поток единовременно (2 ядра).
+_prearm: dict = {}                  # borrower -> {"t":..., "ev":..., "ts": monotonic}
+_prearm_lock = threading.Lock()
+_prearm_busy = threading.Event()
+
+
+def _prearm_get(borrower: str, hf: float) -> tuple[dict, dict] | None:
+    """Свежий армленный (t, ev), если режим close-factor тот же, что при котировке (HF>=0.95:
+    ниже CF переключается 50%->100% и армленный размер перестаёт соответствовать)."""
+    if not C.PREARM or hf < 0.95:
+        return None
+    with _prearm_lock:
+        rec = _prearm.get(borrower)
+        if rec and time.monotonic() - rec["ts"] <= C.PREARM_TTL:
+            return rec["t"], rec["ev"]
+        if rec:
+            del _prearm[borrower]
+    return None
+
+
+def _prearm_drop(borrower: str) -> None:
+    with _prearm_lock:
+        _prearm.pop(borrower, None)
+
+
+def _prearm_quote(rpc: Rpc, book: dict, borrowers: list[str], accounts: dict,
+                  reserves_cfg: dict, gas_usd: float) -> None:
+    """Фоновый поток: refine + evaluate на бритом размере, профитные — в кэш."""
+    try:
+        targets, _ = refine(rpc, book, accounts, borrowers, reserves_cfg,
+                            min_debt_usd=C.MIN_DEBT_USD, watch_hf=C.PREARM_HF,
+                            report_hf=C.PREARM_HF, retries=1)
+        for t in targets:
+            shaved = _resize(t, *C.PREARM_SHAVE) or t
+            ev = evaluate(shaved, gas_usd)
+            if ev and "skip" not in ev and ev.get("profitable"):
+                with _prearm_lock:
+                    _prearm[t["borrower"]] = {"t": shaved, "ev": ev, "ts": time.monotonic()}
+                print(f"  ⚡ armed {t['borrower'][:10]}… HF={t['hf']:.4f} "
+                      f"{shaved['coll_sym']}->{shaved['debt_sym']} net=${ev['net_usd']:+,.1f}")
+    except Exception as e:                    # noqa: BLE001 — фон не смеет ронять процесс
+        print(f"  prearm err: {e}")
+    finally:
+        _prearm_busy.clear()
+
+
+def prearm_tick(rpc: Rpc, book: dict, accounts: dict, reserves_cfg: dict,
+                gas_usd: float) -> None:
+    """Инлайн-вход: выбрать кромку (1.0 <= HF < PREARM_HF, долг >= MIN_DEBT), которой нет
+    свежего арма, и отдать одному фоновому потоку. HF<1 сюда не попадает — это живая цель,
+    её берёт боевой путь этой же итерации."""
+    if not (C.PREARM and C.CONTRACT) or _prearm_busy.is_set():
+        return
+    now = time.monotonic()
+    edge = []
+    for b, a in accounts.items():
+        hf = a["health_factor"] / 1e18
+        if not (1.0 <= hf < C.PREARM_HF and a["health_factor"] < HF_INFINITY):
+            continue
+        if a["total_debt_base"] / ORACLE_BASE_UNIT < C.MIN_DEBT_USD:
+            continue
+        with _prearm_lock:
+            rec = _prearm.get(b)
+        if rec and now - rec["ts"] < C.PREARM_REFRESH_SEC:
+            continue
+        edge.append((a["total_debt_base"], b))
+    if not edge:
+        return
+    edge.sort(reverse=True)
+    picked = [b for _, b in edge[:C.PREARM_MAX]]
+    _prearm_busy.set()
+    threading.Thread(target=_prearm_quote,
+                     args=(rpc, book, picked, accounts, reserves_cfg, gas_usd),
+                     daemon=True).start()
+
+
 def process_targets(rpc: Rpc, targets: list, st: dict, now_ts: float, gas_usd: float) -> list[str]:
     """Run the (unchanged) per-target fire path over `targets`: dedup -> fresh-HF re-check ->
     evaluate() (with the alt-leg no-route fallback) -> profitability gate -> fire(). Returns the
@@ -1105,7 +1208,15 @@ def process_targets(rpc: Rpc, targets: list, st: dict, now_ts: float, gas_usd: f
         if hf_now is not None and hf_now >= 1.0:
             print(f"  skip {key[:10]}…: HF cured to {hf_now:.4f} before fire")
             continue
-        ev = evaluate(t, gas_usd)
+        armed = _prearm_get(key, hf_now if hf_now is not None else t["hf"])
+        if armed is not None:
+            # выстрел с готовой котировкой: LiquidSwap-квота (1.7-3.5с) уже оплачена фоном.
+            # Кэш профитный по построению; экономику на живом размере страхует on-chain
+            # min_profit_wei — устаревшая котировка ревертит, а не теряет деньги.
+            t, ev = armed
+            print(f"  ⚡ arm-hit {key[:10]}…: котировка из кэша")
+        else:
+            ev = evaluate(t, gas_usd)
         # no route on the primary collateral (e.g. exotic Pendle PT) -> try the runner-up leg
         if ev and "skip" in ev and "no LiquidSwap route" in ev["skip"] and t.get("alt"):
             print(f"  skip {key[:10]}… {t['coll_sym']}->{t['debt_sym']}: {ev['skip']}; "
@@ -1130,6 +1241,7 @@ def process_targets(rpc: Rpc, targets: list, st: dict, now_ts: float, gas_usd: f
                 print(f"  skip {key[:10]}… — недостаточно газа на EOA (см. ⛽-алерт)")
                 continue
             fire(t, ev, st, now_ts, gas_usd)
+            _prearm_drop(key)     # использованный арм не смеет пережить свой выстрел
             fired.append(key)
     return fired
 
@@ -1205,6 +1317,12 @@ def _hot_iteration(rpc: Rpc, book: dict, st: dict, hs: dict, gas_usd: float,
     tick = int(hs.get("tick", 0)) + 1
     hs["tick"] = tick
     do_sweep = (C.SWEEP_EVERY <= 1) or (tick % C.SWEEP_EVERY == 0)
+    # Событийный триггер (04.08): свежий ValueUpdate => эта итерация hot-only (чанк курсора
+    # подождёт — цена только что переставила HF всей горячей книги, дорога каждая сотня мс).
+    n_upd = poll_oracle_updates(rpc)
+    if n_upd:
+        do_sweep = False
+        print(f"  ⚡ oracle-upd x{n_upd}: hot-only проход")
     if do_sweep:
         chunk, new_cursor, wrapped = next_chunk(borrowers, hs["cursor"], C.SWEEP_CHUNK)
     else:
@@ -1227,9 +1345,17 @@ def _hot_iteration(rpc: Rpc, book: dict, st: dict, hs: dict, gas_usd: float,
     hs["cursor"] = new_cursor
     hs["hot"] = sorted(hot)
 
+    # pre-arm кромки: фоновые котировки для 1.0<=HF<PREARM_HF (сам троттлится и не блокирует)
+    if not C.DRY_RUN:
+        try:
+            prearm_tick(rpc, book, accounts, reserves_cfg, gas_usd)
+        except Exception as e:
+            print(f"  prearm tick err: {e}")
+
     hfs = [a["health_factor"] / 1e18 for a in accounts.values() if a["health_factor"] < HF_INFINITY]
     return {"n_read": len(accounts), "n_hot": len(hot), "n_targets": len(tgt_borrowers),
             "fired": len(fired), "cursor": new_cursor, "wrapped": wrapped, "chunk": len(chunk),
+            "oracle_upd": n_upd,
             "n_book": len(borrowers), "min_hf": min(hfs) if hfs else None,
             "guard_ok": ok, "reason": reason}
 
@@ -1386,7 +1512,8 @@ def loop() -> None:
             print(f"  shadow tick err: {e}")
         save_state(st)
         save_hotset(hs)
-        time.sleep(C.HOT_POLL_SEC)
+        # после апдейта цены не спать полный интервал: транзиты HF доигрываются 1-3 блока
+        time.sleep(0.05 if status.get("oracle_upd") else C.HOT_POLL_SEC)
 
 
 def main() -> None:
