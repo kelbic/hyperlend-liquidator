@@ -86,6 +86,7 @@ sys.path.insert(0, REPO)
 
 from bot import config as C                                    # noqa: E402
 from bot import liqd                                           # noqa: E402
+from bot import shadow                                         # noqa: E402
 from analysis.aave import (                                    # noqa: E402
     HF_INFINITY, SEL_GET_USER_ACCOUNT_DATA, decode_user_account_data, size_liquidation,
 )
@@ -93,7 +94,7 @@ from analysis.monitor import (                                 # noqa: E402
     discover_borrowers, load_book, load_reserves, refine, save_book, scan, sweep_accounts,
 )
 from analysis.protocols import ORACLE_BASE_UNIT, is_stable, sym  # noqa: E402
-from analysis.rpc import Rpc, _run_with_deadline                 # noqa: E402
+from analysis.rpc import Rpc, _run_with_deadline, http_post_json  # noqa: E402
 
 LIQUIDATE_SIG = "liquidate(address,address,address,uint256,bool,address,bytes,uint256)"
 # Argument types and selector are DERIVED from the signature string above, never hand-pasted
@@ -353,6 +354,7 @@ def alert_async(text: str) -> None:
 def gas_cost_usd(rpc: Rpc) -> float:
     try:
         base = rpc.base_fee()
+        _note_basefee(base)     # кормит кэш _fee_params: путь выстрела без лишнего RPC
     except Exception:
         base = int(0.1 * 1e9)
     return C.GAS_UNITS_EST * base / 1e18 * C.HYPE_USD
@@ -518,8 +520,28 @@ def _evaluate_one(t: dict, gas_usd: float) -> dict | None:
 # Local counter layered over the node's 'pending'. `send_ts` is the monotonic clock of the last
 # BROADCAST (see _pending_nonce): the local bump is only trusted while a send is recent.
 NONCE_SEND_WINDOW_SEC = 120.0
-_nonce_cache: dict = {"addr": None, "next": None, "send_ts": 0.0}
+_nonce_cache: dict = {"addr": None, "next": None, "send_ts": 0.0,
+                      # prewarm (04.08): последний ЧЕЙН-вид pending-nonce + когда прочитан.
+                      # Только ускоряет _pending_nonce (кэш вместо блокирующего RPC на пути
+                      # выстрела); всю семантику local-bump-vs-chain решает прежний код.
+                      "chain": None, "chain_ts": 0.0}
 _owner_addr: str | None = None
+
+
+def prewarm_nonce(addr: str) -> None:
+    """Фоновое обновление чейн-вида pending-nonce (вызывается из цикла раз в NONCE_PREWARM_SEC).
+    НЕ трогает send_ts (инвариант WC-урока: его пишет ТОЛЬКО _nonce_after_send — прогрев,
+    который «благословлял» мёртвый бамп, уже убивал самовосстановление у wc). Ошибка чтения
+    просто оставляет кэш старым — _pending_nonce тогда сходит в RPC сам."""
+    try:
+        pend = int(_rpc_write("eth_getTransactionCount", [addr, "pending"]), 16)
+    except Exception:
+        return
+    if _nonce_cache["addr"] not in (None, addr):
+        return
+    _nonce_cache["addr"] = addr
+    _nonce_cache["chain"] = pend
+    _nonce_cache["chain_ts"] = time.monotonic()
 
 
 class RpcVerdict(RuntimeError):
@@ -552,16 +574,19 @@ def _rpc_write(method: str, params: list, budget: float | None = None):
     always sent (drpc/Cloudflare 403 any request without one — the flock lesson that killed a
     SEND on 2026-07-17). A node's in-body error is a VERDICT and propagates verbatim; the caller
     (not this layer) decides whether a verdict is fatal."""
+    return _rpc_write_url(C.RPC_WRITE, method, params, budget)
+
+
+def _rpc_write_url(url: str, method: str, params: list, budget: float | None = None):
+    """То же, но на явный url — строительный блок параллельного залпа (_broadcast_raw).
+    Транспорт keep-alive (analysis/rpc.py http_post_json): TLS-рукопожатие на каждом вызове
+    съедало ~260мс из 275 всей трассы (замер 04.08) — на пути выстрела это львиная доля."""
     body = json.dumps({"jsonrpc": "2.0", "id": 1,
                        "method": method, "params": params}).encode()
     wall = C.RPC_HARD_TIMEOUT if budget is None else budget
 
     def _attempt():
-        req = urllib.request.Request(C.RPC_WRITE, data=body,
-                                     headers={"Content-Type": "application/json",
-                                              "User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=C.RPC_TIMEOUT) as r:
-            return json.loads(r.read())
+        return http_post_json(url, body, C.RPC_TIMEOUT)
 
     d = _run_with_deadline(_attempt, wall)
     if d.get("error"):
@@ -587,7 +612,15 @@ def _pending_nonce(addr: str) -> int:
     stamped by _nonce_after_send and NOWHERE else: WC's follow-up bug was a prewarm path that also
     refreshed the timestamp, which kept re-blessing the dead bump and muted the self-heal
     permanently. Nothing here may refresh send_ts without an actual send."""
-    pend = int(_rpc_write("eth_getTransactionCount", [addr, "pending"]), 16)
+    fresh = (C.NONCE_PREWARM_SEC > 0 and _nonce_cache["addr"] == addr
+             and _nonce_cache.get("chain") is not None
+             and time.monotonic() - _nonce_cache.get("chain_ts", 0.0) <= 2 * C.NONCE_PREWARM_SEC)
+    if fresh:
+        pend = _nonce_cache["chain"]      # prewarm: кэш вместо ~50-250мс RPC на пути выстрела
+    else:
+        pend = int(_rpc_write("eth_getTransactionCount", [addr, "pending"]), 16)
+        _nonce_cache["chain"], _nonce_cache["chain_ts"] = pend, time.monotonic()
+        _nonce_cache["addr"] = addr if _nonce_cache["addr"] is None else _nonce_cache["addr"]
     nxt = _nonce_cache["next"]
     if _nonce_cache["addr"] != addr or nxt is None or nxt <= pend:
         return pend
@@ -610,17 +643,53 @@ def _nonce_after_send(addr: str, used: int) -> None:
     _nonce_cache["send_ts"] = time.monotonic()
 
 
-def _fee_params() -> tuple[int, int]:
+# Свежий baseFee из цикла (gas_cost_usd читает его каждую итерацию по read-пути): кэш снимает
+# ещё один блокирующий RPC с пути выстрела. Срок годности короткий (BASEFEE_CACHE_SEC, деф. 2.5с
+# ≈ 2 блока): 2x-запас maxFee покрывает рост базы EIP-1559 на таком окне с большим запасом.
+_basefee_cache: dict = {"wei": None, "ts": 0.0}
+
+
+def _note_basefee(base_wei: int) -> None:
+    _basefee_cache["wei"], _basefee_cache["ts"] = base_wei, time.monotonic()
+
+
+def _tip_wei(net_usd: float | None, st: dict | None = None) -> int:
+    """Чаевые за место в блоке (04.08: малые блоки упорядочены по tip — см. config.TIP_MODE).
+    Платим долю приза, зажатую в [TIP_MIN, TIP_MAX]; перевод $ -> gwei через оценочный gasUsed
+    и статичный HYPE_USD (обе величины грубые, но ошибка ±30% сдвигает tip, а не ломает его).
+
+    Потолок по балансу: узел требует balance >= GAS_LIMIT*(2*base+tip) ЦЕЛИКОМ — щедрые чаевые
+    на тощем кошельке превратили бы проходной выстрел в insufficient funds. Лучше выстрел без
+    чаевых, чем никакого: тогда tip зажимается в остаток конверта (вплоть до 0)."""
+    if C.TIP_MODE != "auto":
+        return int(C.PRIORITY_GWEI * 1e9)
+    budget_usd = max(0.0, net_usd or 0.0) * C.TIP_PRIZE_FRAC
+    denom = C.HYPE_USD * C.GAS_UNITS_EST * 1e-9          # $ за 1 gwei чаевых на всю tx
+    per_gas_gwei = budget_usd / denom if denom > 0 else 0.0
+    tip_gwei = min(C.TIP_MAX_GWEI, max(C.TIP_MIN_GWEI, per_gas_gwei))
+    bal = (st or {}).get("balance_hype")
+    base = _basefee_cache["wei"]
+    if bal is not None and base is not None and C.GAS_LIMIT > 0:
+        afford_gwei = (bal * 1e18 / C.GAS_LIMIT - 2 * base) / 1e9
+        tip_gwei = max(0.0, min(tip_gwei, afford_gwei))
+    return int(tip_gwei * 1e9)
+
+
+def _fee_params(tip_wei: int | None = None) -> tuple[int, int]:
     """EIP-1559 fee (HyperEVM is type-0x2; our 2026-07-19 canary went out exactly this way).
-    maxPriorityFeePerGas = HL_PRIORITY_GWEI (0: the chain is latency-FCFS, a tip buys NO ordering
-    — paying one is pure donation). maxFeePerGas = baseFee*2 + priority: maxFee is a CAP, not a
-    payment (the block charges the actual base), so the 2x headroom is economically free and only
-    protects against a baseFee rise between signing and inclusion. Falls back to eth_gasPrice if
-    baseFee is unavailable."""
-    priority = int(C.PRIORITY_GWEI * 1e9)
+    maxPriorityFeePerGas: чаевые из _tip_wei (04.08 — премисса «tip ничего не покупает»
+    опровергнута замером, малые блоки упорядочены по tip). maxFeePerGas = baseFee*2 + priority:
+    maxFee is a CAP, not a payment (the block charges the actual base), so the 2x headroom is
+    economically free and only protects against a baseFee rise between signing and inclusion.
+    Falls back to eth_gasPrice if baseFee is unavailable."""
+    priority = int(C.PRIORITY_GWEI * 1e9) if tip_wei is None else tip_wei
+    age = time.monotonic() - _basefee_cache["ts"]
+    if _basefee_cache["wei"] is not None and 0 < C.BASEFEE_CACHE_SEC and age <= C.BASEFEE_CACHE_SEC:
+        return _basefee_cache["wei"] * 2 + priority, priority
     try:
         blk = _rpc_write("eth_getBlockByNumber", ["latest", False])
         base = int(blk["baseFeePerGas"], 16)
+        _note_basefee(base)
         return base * 2 + priority, priority
     except Exception:
         return int(_rpc_write("eth_gasPrice", []), 16) + priority, priority
@@ -673,13 +742,62 @@ class SendUndelivered(RuntimeError):
 _ALREADY_IN_POOL = ("already known", "known transaction", "already in the pool")
 
 
+def _broadcast_raw(raw_hex: str) -> str:
+    """Залп eth_sendRawTransaction во все BROADCAST_RPCS одновременно; первый ack побеждает.
+
+    Тот же raw payload на N узлов — это ОДНА транзакция (одинаковый хэш): дубли гасятся полом
+    «already known», который здесь равен доставке. Семантика исходов сохранена бит-в-бит:
+      * хоть один узел принял (или уже знает) -> hash;
+      * ВСЕ узлы дали явный вердикт-отказ -> RpcVerdict (первый; caller превратит в
+        SendUndelivered — tx ни в одном мемпуле);
+      * иначе (все обрывы / вердикты вперемешку с обрывами) -> транспортная ошибка
+        (caller превратит в SendAmbiguous — доставку исключить нельзя).
+    Откат HL_PARALLEL_BROADCAST=0 — прежний одиночный C.RPC_WRITE."""
+    urls = C.BROADCAST_RPCS if C.PARALLEL_BROADCAST else [C.RPC_WRITE]
+    if len(urls) == 1:
+        # одиночный путь = откат-путь: идёт через исторический сим _rpc_write (его же
+        # подменяют тесты write-семантики), поведение бит-в-бит прежнее
+        if urls[0] == C.RPC_WRITE:
+            return _rpc_write("eth_sendRawTransaction", [raw_hex])
+        return _rpc_write_url(urls[0], "eth_sendRawTransaction", [raw_hex])
+    results: dict = {}
+    winner = threading.Event()
+
+    def one(u: str) -> None:
+        try:
+            results[u] = ("ok", _rpc_write_url(u, "eth_sendRawTransaction", [raw_hex]))
+            winner.set()
+        except RpcVerdict as e:
+            if any(m in str(e).lower() for m in _ALREADY_IN_POOL):
+                results[u] = ("ok", None)         # узел уже держит tx = доставлено
+                winner.set()
+            else:
+                results[u] = ("verdict", e)
+        except Exception as e:                     # noqa: BLE001 — транспорт любой природы
+            results[u] = ("err", e)
+        if len(results) == len(urls):
+            winner.set()                          # все ответили (пусть и плохо) — не ждать стену
+
+    threads = [threading.Thread(target=one, args=(u,), daemon=True) for u in urls]
+    for t in threads:
+        t.start()
+    winner.wait(C.RPC_HARD_TIMEOUT + 1.0)
+    oks = [v for k, v in results.items() if v[0] == "ok"]
+    if oks:
+        return next((v[1] for v in oks if v[1]), None) or ""   # хэш от узла; "" -> локальный хэш caller'а
+    if len(results) == len(urls) and all(v[0] == "verdict" for v in results.values()):
+        raise next(v[1] for v in results.values())             # единогласный отказ = вердикт
+    errs = [v[1] for v in results.values() if v[0] == "err"]
+    raise (errs[0] if errs else TimeoutError(f"broadcast: no ack from {len(urls)} urls"))
+
+
 def _signed_tx_hash(signed) -> str:
     """0x-hash of a signed payload, computed locally — available BEFORE the broadcast."""
     h = signed.hash
     return h.to_0x_hex() if hasattr(h, "to_0x_hex") else "0x" + bytes(h).hex()
 
 
-def _sign_and_send(calldata: str) -> str:
+def _sign_and_send(calldata: str, tip_wei: int | None = None) -> str:
     """Sign an EIP-1559 tx locally and broadcast it. Returns the tx hash.
 
     THREE outcomes, and conflating the last two loses real money:
@@ -704,7 +822,7 @@ def _sign_and_send(calldata: str) -> str:
     addr = owner_address()
     if not addr:
         raise RuntimeError("no signing key (HL_PRIVATE_KEY / HL_KEYFILE)")
-    max_fee, priority = _fee_params()
+    max_fee, priority = _fee_params(tip_wei)
     nonce = _pending_nonce(addr)
     tx = {"chainId": C.CHAIN_ID, "nonce": nonce, "to": to_checksum_address(C.CONTRACT),
           "value": 0, "gas": C.GAS_LIMIT, "maxFeePerGas": max_fee,
@@ -714,7 +832,7 @@ def _sign_and_send(calldata: str) -> str:
     raw_hex = raw.to_0x_hex() if hasattr(raw, "to_0x_hex") else "0x" + raw.hex()
     local_hash = _signed_tx_hash(signed)      # known BEFORE the wire — survives an ambiguous send
     try:
-        txh = _rpc_write("eth_sendRawTransaction", [raw_hex])
+        txh = _broadcast_raw(raw_hex) or local_hash
     except RpcVerdict as e:
         if any(m in str(e).lower() for m in _ALREADY_IN_POOL):
             _nonce_after_send(addr, nonce)    # the node HAS it: delivered, just re-acked
@@ -763,7 +881,7 @@ def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
     maybe = ""
     try:
         calldata = _encode_liquidate(t, ev)
-        txh = _sign_and_send(calldata)
+        txh = _sign_and_send(calldata, tip_wei=_tip_wei(ev.get("net_usd"), st))
     except SendAmbiguous as e:
         # DELIVERY UNKNOWN — book it exactly like a successful send. A tx we cannot rule out is
         # live must be tracked: untracked, its gas escapes the daily cap, a revert never reaches
@@ -1257,6 +1375,15 @@ def loop() -> None:
         heartbeat(st)
         if not C.DRY_RUN:
             check_balance(st, time.time())   # периодический газ-гард (троттлится внутри)
+        # --- ярус 1 (04.08): prewarm nonce + shadow-телеметрия; оба не смеют ронять цикл ---
+        if C.NONCE_PREWARM_SEC > 0 and not C.DRY_RUN and C.RAW_TX:
+            addr = owner_address()
+            if addr and time.monotonic() - _nonce_cache.get("chain_ts", 0.0) >= C.NONCE_PREWARM_SEC:
+                prewarm_nonce(addr)
+        try:
+            shadow.tick(rpc, book, hs, st)   # троттлится сам; тяжесть в daemon-потоке
+        except Exception as e:
+            print(f"  shadow tick err: {e}")
         save_state(st)
         save_hotset(hs)
         time.sleep(C.HOT_POLL_SEC)

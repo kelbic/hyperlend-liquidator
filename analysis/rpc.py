@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 CHAIN_ID = 999
@@ -27,6 +30,97 @@ CHAIN_ID = 999
 # Indirection so tests can inject a fake transport (a hanging / timing-out endpoint) without a
 # network. Production code always uses the real urllib.request.urlopen.
 _urlopen = urllib.request.urlopen
+
+# --------------------------------------------------------------------------- keep-alive pool
+# 04.08: замер трассы с этой машины — total ~275мс на запрос, из них connect 8-14мс, всё
+# остальное TLS-рукопожатие, потому что urllib открывает НОВОЕ соединение на каждый вызов.
+# Пул держит по одному живому HTTPS-соединению на endpoint; каждый вызов ЗАБИРАЕТ соединение
+# из пула (эксклюзивное владение — параллельный вызов того же endpoint строит второе, а не
+# делит сокет), и ВОЗВРАЩАЕТ только после полностью прочитанного ответа. Любая ошибка
+# закрывает соединение вместо возврата. Откат: HL_KEEPALIVE=0 — прежний urllib-путь.
+_KEEPALIVE = os.environ.get("HL_KEEPALIVE", "1") != "0"
+_pool_lock = threading.Lock()
+_pool: dict[str, http.client.HTTPConnection] = {}     # url -> idle connection
+
+# Ошибки ФАЗЫ ОТПРАВКИ на лежалом соединении (сервер молча закрыл idle keep-alive): запрос до
+# обработки не дошёл, немедленный повтор на СВЕЖЕМ соединении безопасен даже для send-пути —
+# повторный eth_sendRawTransaction того же payload это тот же tx-хэш ("already known", не дубль).
+_STALE_CONN_ERRS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                    http.client.RemoteDisconnected, http.client.CannotSendRequest)
+
+
+def _new_conn(url: str, timeout: float) -> http.client.HTTPConnection:
+    u = urllib.parse.urlsplit(url)
+    host = u.hostname or ""
+    if u.scheme == "https":
+        return http.client.HTTPSConnection(host, u.port or 443, timeout=timeout,
+                                           context=ssl.create_default_context())
+    return http.client.HTTPConnection(host, u.port or 80, timeout=timeout)
+
+
+def _conn_post(conn: http.client.HTTPConnection, url: str, body: bytes, timeout: float):
+    u = urllib.parse.urlsplit(url)
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    if conn.sock is not None:
+        conn.sock.settimeout(timeout)
+    conn.request("POST", path, body=body,
+                 headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0",
+                          "Host": u.netloc, "Connection": "keep-alive"})
+    resp = conn.getresponse()
+    data = resp.read()                     # дочитать ДО возврата в пул — иначе сокет отравлен
+    if resp.status != 200:
+        raise urllib.error.HTTPError(url, resp.status, data[:200].decode("utf-8", "replace"),
+                                     resp.headers, None)
+    return json.loads(data)
+
+
+def http_post_json(url: str, body: bytes, timeout: float):
+    """POST JSON на url с keep-alive пулом; возвращает распарсенный JSON-ответ.
+    При HL_KEEPALIVE=0 — прежний urllib-путь без пула (откат одним env).
+    Если тест подменил _urlopen (fake-транспорт) — тоже urllib-путь, пул в сеть не лезет."""
+    if not _KEEPALIVE or _urlopen is not urllib.request.urlopen:
+        req = urllib.request.Request(url, data=body, headers={
+            "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+        with _urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    with _pool_lock:
+        conn = _pool.pop(url, None)
+    fresh = conn is None
+    if fresh:
+        conn = _new_conn(url, timeout)
+    try:
+        out = _conn_post(conn, url, body, timeout)
+    except _STALE_CONN_ERRS:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if fresh:
+            raise                          # свежее соединение так не падает — настоящая ошибка
+        conn = _new_conn(url, timeout)     # лежалое умерло молча: один немедленный повтор
+        try:
+            out = _conn_post(conn, url, body, timeout)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+    with _pool_lock:
+        prev = _pool.get(url)
+        _pool[url] = conn
+    if prev is not None and prev is not conn:
+        try:
+            prev.close()                   # параллельная ветка вернулась раньше — лишнее закрыть
+        except Exception:
+            pass
+    return out
 
 
 class HardTimeout(TimeoutError):
@@ -144,11 +238,7 @@ class Rpc:
         """One HTTP attempt to `url`, optionally under the hard wall deadline. Returns the parsed
         JSON-RPC result or raises (RpcError for a genuine node error; transport errors otherwise)."""
         def do():
-            req = urllib.request.Request(
-                url, data=body,
-                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
-            with _urlopen(req, timeout=self.timeout) as r:
-                return json.loads(r.read())
+            return http_post_json(url, body, self.timeout)
         d = _run_with_deadline(do, self.hard_timeout) if self.hard_timeout else do()
         if "error" in d:
             err = d["error"]

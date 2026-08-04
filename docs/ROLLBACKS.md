@@ -1,0 +1,31 @@
+# Реестр откатов (hyperlend-liquidator)
+
+Каждая боевая правка обязана иметь однострочный откат. Формат: что включено → как откатить.
+Все флаги — env (`~/.hyperlend-bot/env`) + рестарт (kill PID из `bot.pid.txt`, cron поднимет ≤60с).
+
+## Ярус 1 гонки (04.08, GO владельца)
+
+| Что | Флаг вкл. (деф.) | Откат | Прежнее поведение |
+|---|---|---|---|
+| Keep-alive HTTP-пул (read+write) | `HL_KEEPALIVE=1` | `HL_KEEPALIVE=0` | urllib, новый TLS на каждый вызов |
+| Динамические чаевые (доля приза, кламп [5,1000] gwei, потолок по балансу) | `HL_TIP_MODE=auto` | `HL_TIP_MODE=off` | `HL_PRIORITY_GWEI` (0) |
+| Параллельный залп sendRawTransaction | `HL_PARALLEL_BROADCAST=1` | `=0` | одиночный `HL_RPC` |
+| Nonce prewarm (кэш chain-вида, 15с) | `HL_NONCE_PREWARM_SEC=15` | `=0` | живой RPC на пути выстрела |
+| Кэш baseFee для fee-параметров (2.5с) | `HL_BASEFEE_CACHE_SEC=2.5` | `=0` | живой RPC на пути выстрела |
+| Shadow-race телеметрия чужих ликвидаций | `HL_SHADOW=1` | `=0` | телеметрии нет |
+
+## Ярус 0 + инфра (04.08)
+
+| Что | Значение | Откат |
+|---|---|---|
+| Суточный газ-кап | `HL_MAX_DAILY_GAS_USD=50` | `=5` |
+| Порядок read-узлов (drpc первым: 22-35мс против 205-235 из Вены) | drpc,hyperlend,official | hyperlend,drpc,official (порядок 23.07) |
+
+Бэкапы env: `$CLAUDE_JOB_DIR/tmp/hl_env.bak.*`.
+
+## Старые (до 04.08)
+
+| Что | Откат |
+|---|---|
+| Внутренняя подпись вместо cast (`HL_RAW_TX=1`, 20.07) | `HL_RAW_TX=0` |
+| Амортизированный hot-set цикл + `HL_SWEEP_EVERY=3` (30.07) | `HL_SWEEP_EVERY=1` |

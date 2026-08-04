@@ -427,20 +427,31 @@ class _FakeWrite:
 
 
 def _armed_raw(fake_write, contract=_TEST_CONTRACT):
-    """Context: live-armed on the raw-tx path with the write endpoint faked."""
+    """Context: live-armed on the raw-tx path with the write endpoint faked.
+
+    04.08: этот харнесс проверяет СЕМАНТИКУ одиночной отправки (вердикт/обрыв/нонс), поэтому
+    параллельный залп здесь выключается — он ходит по _rpc_write_url мимо фейка и имеет
+    собственные тесты (test_tier1). Кэш baseFee сбрасывается: он módуль-глобален и иначе
+    протекает между тестами."""
     o = (C.DRY_RUN, C.CONTRACT, C.PRIVATE_KEY, C.RAW_TX, E._rpc_write,
-         E._nonce_cache.copy(), E._owner_addr)
+         E._nonce_cache.copy(), E._owner_addr, C.PARALLEL_BROADCAST, C.NONCE_PREWARM_SEC,
+         dict(E._basefee_cache))
     C.DRY_RUN, C.CONTRACT, C.PRIVATE_KEY, C.RAW_TX = False, contract, _TEST_KEY, True
+    C.PARALLEL_BROADCAST, C.NONCE_PREWARM_SEC = False, 0.0
     E._rpc_write = fake_write
-    E._nonce_cache.update({"addr": None, "next": None, "send_ts": 0.0})
+    E._nonce_cache.update({"addr": None, "next": None, "send_ts": 0.0,
+                           "chain": None, "chain_ts": 0.0})
+    E._basefee_cache.update({"wei": None, "ts": 0.0})
     E._owner_addr = None
     return o
 
 
 def _restore_raw(o):
-    (C.DRY_RUN, C.CONTRACT, C.PRIVATE_KEY, C.RAW_TX, E._rpc_write, cache, E._owner_addr) = o
+    (C.DRY_RUN, C.CONTRACT, C.PRIVATE_KEY, C.RAW_TX, E._rpc_write, cache, E._owner_addr,
+     C.PARALLEL_BROADCAST, C.NONCE_PREWARM_SEC, basefee) = o
     E._nonce_cache.clear()
     E._nonce_cache.update(cache)
+    E._basefee_cache.update(basefee)
 
 
 def _capture_signed_tx():
@@ -490,12 +501,14 @@ def test_fee_params_falls_back_to_gas_price_without_base_fee():
             return hex(3 * 10 ** 9)
         raise AssertionError(method)
 
-    o_w, o_p = E._rpc_write, C.PRIORITY_GWEI
+    o_w, o_p, o_bf = E._rpc_write, C.PRIORITY_GWEI, dict(E._basefee_cache)
     E._rpc_write, C.PRIORITY_GWEI = no_base, 0.0
+    E._basefee_cache.update({"wei": None, "ts": 0.0})   # кэш 04.08 модуль-глобален — обнулить
     try:
-        max_fee, priority = E._fee_params()
+        max_fee, priority = E._fee_params(tip_wei=0)
     finally:
         E._rpc_write, C.PRIORITY_GWEI = o_w, o_p
+        E._basefee_cache.update(o_bf)
     assert priority == 0 and max_fee == 3 * 10 ** 9
 
 

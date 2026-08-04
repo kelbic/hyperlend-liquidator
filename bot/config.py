@@ -46,8 +46,19 @@ MAX_IMPACT = float(os.environ.get("HL_MAX_IMPACT", "0.05"))     # skip if Liquid
 WATCH_HF = float(os.environ.get("HL_WATCH_HF", "1.10"))         # refine reserves below this HF
 REPORT_HF = float(os.environ.get("HL_REPORT_HF", "1.15"))
 
-# HyperEVM: priority fee is NON-OPERATIVE (latency-FCFS, no priority auction) -> set ~0.
+# 04.08 ПРЕМИССА «latency-FCFS, no priority auction» ОПРОВЕРГНУТА замером (STATE 04.08):
+# малые блоки HyperEVM упорядочены по tip убыв. (нарушения — только нонс-цепочки одного
+# отправителя), победители часа раздачи 10.10 платили 80–1,225 gwei, наш tip=0 ставит нас
+# ПОСЛЕДНИМИ в любом спорном блоке. При этом переплата вредна: оракул-push сам является tx
+# с tip, и tx с tip ВЫШЕ пуша исполняется ДО обновления цены — реверт (реверты 10.10 платили
+# 13–15k gwei). Политика: tip = TIP_PRIZE_FRAC от приза, зажатый в [TIP_MIN, TIP_MAX].
+# Приор [5, 1000] gwei — из эмпирики победителей; уточняется shadow-телеметрией.
+# ОТКАТ: HL_TIP_MODE=off — прежнее поведение (PRIORITY_GWEI, по умолчанию 0).
 PRIORITY_GWEI = float(os.environ.get("HL_PRIORITY_GWEI", "0"))
+TIP_MODE = os.environ.get("HL_TIP_MODE", "auto")                 # auto | off
+TIP_MIN_GWEI = float(os.environ.get("HL_TIP_MIN_GWEI", "5"))
+TIP_MAX_GWEI = float(os.environ.get("HL_TIP_MAX_GWEI", "1000"))
+TIP_PRIZE_FRAC = float(os.environ.get("HL_TIP_PRIZE_FRAC", "0.05"))   # ≤5% приза на чаевые
 # HARD gas limit — eth_estimateGas is unreliable/silently-passing on the flashloan+liq+swap
 # callback path; NEVER estimate. Generous enough for flashLoanSimple -> liquidationCall -> swap
 # -> repay -> sweep.
@@ -121,6 +132,30 @@ REVERT_COOLDOWN_SEC = float(os.environ.get("HL_REVERT_COOLDOWN_SEC", "300"))
 HEARTBEAT_SEC = float(os.environ.get("HL_HEARTBEAT_SEC", "0"))  # OFF by default (quiet cadence)
 
 RAW_TX = os.environ.get("HL_RAW_TX", "0") == "1"               # 0 = cast (default), 1 = eth_account
+
+# --- ярус 1 гонки (04.08, GO владельца; каждая ручка — самостоятельный откат) -------------------
+# Параллельный залп: eth_sendRawTransaction во ВСЕ write-эндпоинты одновременно, первый ack
+# побеждает (порт e94b940 c Base: spawn 4мс vs 70-140мс; здесь — страховка от 429 одного узла
+# в штормовой час, мы сами ловили -32005 на официальном узле в штиль). ОТКАТ: =0 (один RPC_WRITE).
+PARALLEL_BROADCAST = os.environ.get("HL_PARALLEL_BROADCAST", "1") == "1"
+BROADCAST_RPCS = [r.strip() for r in os.environ.get(
+    "HL_BROADCAST_RPCS",
+    RPC_WRITE + "," + ",".join(u for u in READ_RPCS if u != RPC_WRITE)).split(",") if r.strip()]
+# Nonce prewarm: pending-nonce обновляется фоном раз в N секунд, выстрел берёт кэш вместо
+# блокирующего RPC (~50-250мс с трассы). Инварианты WC-урока (send_ts пишет ТОЛЬКО
+# _nonce_after_send, chain-вид не благословляет локальный бамп) не тронуты. ОТКАТ: =0.
+NONCE_PREWARM_SEC = float(os.environ.get("HL_NONCE_PREWARM_SEC", "15"))
+# Кэш baseFee для _fee_params: свежее чтение итерации (~1-3с) вместо RPC на пути выстрела.
+# Старше BASEFEE_CACHE_SEC — как раньше, живой запрос. ОТКАТ: =0.
+BASEFEE_CACHE_SEC = float(os.environ.get("HL_BASEFEE_CACHE_SEC", "2.5"))
+# Shadow-race телеметрия: каждая ЧУЖАЯ ликвидация пула -> data/shadow_races.jsonl (кто взял,
+# каким tip, каким индексом в блоке, был ли оракул-push рядом, видели ли МЫ жертву и прошли
+# ли бы гарды). Единственный источник данных для тюнинга tip-политики и вилки predict.
+# ОТКАТ: =0 (не влияет на горячий цикл — тяжёлая часть в daemon-потоке).
+SHADOW = os.environ.get("HL_SHADOW", "1") == "1"
+SHADOW_EVERY_SEC = float(os.environ.get("HL_SHADOW_EVERY_SEC", "60"))
+SHADOW_FILE = os.environ.get("HL_SHADOW_FILE", os.path.join(DATA_DIR, "shadow_races.jsonl"))
+SHADOW_CKPT = os.environ.get("HL_SHADOW_CKPT", os.path.join(DATA_DIR, "shadow_ckpt.json"))
 
 STATE_FILE = os.path.expanduser(os.environ.get("HL_STATE", "~/.hyperlend-bot/state.json"))
 LOCK_FILE = os.path.expanduser(os.environ.get("HL_LOCK", "~/.hyperlend-bot/executor.lock"))
