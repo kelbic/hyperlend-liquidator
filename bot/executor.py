@@ -990,10 +990,16 @@ def _rcpt_status(rcpt: dict) -> int | None:
         return None
 
 
-def _settle_gas(st: dict, rec: dict, rcpt: dict) -> float:
+def _settle_gas(st: dict, rec: dict, rcpt: dict, status: int | None = None) -> float:
     """Swap the provisional gas charge for the ACTUAL cost of this tx. Runs exactly once per tx,
     at the moment the receipt is decided — so a tx is never charged twice, and never charged at
     an estimate when the real number is available.
+
+    04.08 («го»): the daily cap bounds LOSS, not turnover. A SUCCESSFUL tx (status==1) refunds its
+    provisional charge and adds nothing back — the prize repaid its own gas inside the same tx. The
+    old semantics (wins burn budget too) muted the bot after the very first success of a cascade
+    hour: one win at 375+ gwei base ≈ $75-120 > the whole $50 day. Reverts and unknowns still count
+    in full — they are the loss the cap exists to bound. Rollback: HL_CAP_COUNT_WINS=1.
 
     The undo is scoped to the DAY the charge was made. _roll_day zeroes gas_usd at the UTC
     boundary; an unconditional refund afterwards subtracts yesterday's estimate from today's fresh
@@ -1014,7 +1020,8 @@ def _settle_gas(st: dict, rec: dict, rcpt: dict) -> float:
         print(f"  gas settle ${actual:.4f} on a tx charged {rec['gas_day']} (today "
               f"{st.get('day')}): day closed, leaving today's counter untouched")
         return actual
-    st["gas_usd"] = max(0.0, st["gas_usd"] - rec.get("gas_usd", 0.0)) + actual
+    win = status == 1 and not C.CAP_COUNT_WINS
+    st["gas_usd"] = max(0.0, st["gas_usd"] - rec.get("gas_usd", 0.0)) + (0.0 if win else actual)
     return actual
 
 
@@ -1070,7 +1077,7 @@ def _check_pending(rpc: Rpc, st: dict, now_ts: float) -> None:
                 # as a revert would let one node answering garbage trip the kill-switch.
                 print(f"  pending {txh[:14]}…: unparsable receipt status; retrying next pass")
                 continue
-            actual = _settle_gas(st, rec, rcpt)
+            actual = _settle_gas(st, rec, rcpt, status)
             if status == 1:
                 st["consec_reverts"] = 0
                 for k in keys:

@@ -120,6 +120,50 @@ contract HyperLendLiquidator {
         bytes calldata swapCallData,
         uint256 minProfit
     ) external onlyOwner nonReentrant returns (uint256 profit) {
+        profit = _liquidate(collateralAsset, debtAsset, user, debtToCover, useFlashloan, swapTarget, swapCallData, minProfit);
+    }
+
+    /// @notice Same as liquidate(), preceded by an atomic oracle push: `oracleTarget` is called
+    /// with `oracleCalldata` (a fresh signed RedStone payload -> the price feed adapter) BEFORE the
+    /// flash loan, so the liquidation runs against the price that makes the position liquidatable
+    /// in the SAME transaction — the technique the 04.08 race analysis proved the field leader
+    /// uses (push is permissionless; waiting for the relayer's confirmed push loses by one block
+    /// structurally).
+    /// @dev The push TOLERATES failure on purpose: if someone else's push landed earlier in this
+    /// block, the adapter rejects ours as not-newer — but the price is already fresh, so the
+    /// liquidation below must still run. A broken payload therefore degrades to the reactive path
+    /// instead of blocking it; the off-chain bot detects a rejected push by the absence of our
+    /// ValueUpdate in the receipt logs. The real safety gates are unchanged: liquidationCall's own
+    /// HF check, CannotRepay and ProfitTooLow.
+    function liquidateWithPush(
+        address oracleTarget,
+        bytes calldata oracleCalldata,
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool useFlashloan,
+        address swapTarget,
+        bytes calldata swapCallData,
+        uint256 minProfit
+    ) external onlyOwner nonReentrant returns (uint256 profit) {
+        if (oracleTarget != address(0)) {
+            (bool pushed,) = oracleTarget.call(oracleCalldata);
+            pushed; // deliberate: see @dev — a rejected push must not block the liquidation
+        }
+        profit = _liquidate(collateralAsset, debtAsset, user, debtToCover, useFlashloan, swapTarget, swapCallData, minProfit);
+    }
+
+    function _liquidate(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool useFlashloan,
+        address swapTarget,
+        bytes calldata swapCallData,
+        uint256 minProfit
+    ) internal returns (uint256 profit) {
         uint256 balBefore = IERC20(debtAsset).balanceOf(address(this));
 
         if (useFlashloan) {
@@ -177,6 +221,14 @@ contract HyperLendLiquidator {
         _forceApprove(debtAsset, POOL, debtToCover);
         IPool(POOL).liquidationCall(collateralAsset, debtAsset, user, debtToCover, false);
         _forceApprove(debtAsset, POOL, 0); // drop any dangling allowance
+
+        // coll == debt (04.08: 55 events / ~$44k bonus structurally unreachable before this): the
+        // seized collateral IS the repayment asset — there is no route to swap into itself, and
+        // the unconditional swap made every such position revert as "no route". Skip the swap; the
+        // CannotRepay / ProfitTooLow gates still guarantee the economics. NothingSeized is not
+        // checkable here for the flash path (the balance already holds the flash-loaned debt), but
+        // a liquidation that seized nothing fails those same gates anyway.
+        if (collateralAsset == debtAsset) return;
 
         uint256 collBal = IERC20(collateralAsset).balanceOf(address(this));
         if (collBal == 0) revert NothingSeized();

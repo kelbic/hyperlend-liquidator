@@ -83,6 +83,22 @@ contract MockSwap {
     }
 }
 
+/// @dev Mock RedStone price-feed adapter: counts pushes; `breakNext` makes the next push revert
+/// (the "someone else's push landed first this block -> not-newer" case).
+contract MockOracleAdapter {
+    uint256 public pushes;
+    bool public breakNext;
+
+    function setBreakNext(bool b) external {
+        breakNext = b;
+    }
+
+    function updateDataFeedsValuesPartial(bytes32[] calldata) external {
+        if (breakNext) revert("DataTimestampMustBeNewer");
+        pushes += 1;
+    }
+}
+
 // --- tests ---------------------------------------------------------------------------------
 
 contract HyperLendLiquidatorTest is Test {
@@ -181,5 +197,89 @@ contract HyperLendLiquidatorTest is Test {
         liq.sweep(address(coll));
         liq.sweep(address(coll)); // owner ok
         assertEq(coll.balanceOf(owner), 123);
+    }
+
+    // --- v2: coll == debt (04.08 — 55 events / ~$44k bonus were structurally unreachable) ----
+
+    /// The seized collateral IS the repayment asset: no swap exists or is needed. swapTarget = 0.
+    function test_sameAssetFlashPathSkipsSwap() public {
+        MockPool p2 = new MockPool(debt, debt, 11); // seizes the DEBT token itself
+        HyperLendLiquidator l2 = new HyperLendLiquidator(address(p2));
+        debt.mint(address(p2), 1_000_000e6);
+
+        uint256 debtToCover = 1_000e6;
+        uint256 ownerBefore = debt.balanceOf(owner);
+        uint256 profit =
+            l2.liquidate(address(debt), address(debt), user, debtToCover, true, address(0), "", 50e6);
+
+        // seized = 11x, repaid 1x, premium 0.04%: profit = 10x - premium, no router involved
+        uint256 expected = debtToCover * 10 - (debtToCover * 4) / 10000;
+        assertEq(profit, expected, "same-asset profit");
+        assertEq(debt.balanceOf(owner) - ownerBefore, profit, "swept to owner");
+        assertEq(debt.balanceOf(address(l2)), 0, "nothing left on the contract");
+    }
+
+    function test_sameAssetCapitalPath() public {
+        MockPool p2 = new MockPool(debt, debt, 11);
+        HyperLendLiquidator l2 = new HyperLendLiquidator(address(p2));
+        uint256 debtToCover = 1_000e6;
+        debt.mint(address(l2), debtToCover); // operator pre-funded, no premium
+        uint256 profit =
+            l2.liquidate(address(debt), address(debt), user, debtToCover, false, address(0), "", 50e6);
+        assertEq(profit, debtToCover * 10, "capital-path same-asset profit");
+    }
+
+    // --- v2: atomic oracle push (04.08 — the field leader's technique, permissionless) --------
+
+    function _pushData() internal pure returns (bytes memory) {
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = bytes32("HYPE");
+        return abi.encodeWithSelector(MockOracleAdapter.updateDataFeedsValuesPartial.selector, ids);
+    }
+
+    function test_pushRunsBeforeLiquidation() public {
+        MockOracleAdapter oracle = new MockOracleAdapter();
+        uint256 debtToCover = 1_000e6;
+        uint256 seized = debtToCover * 11;
+        uint256 swapOut = 1_100e6;
+        uint256 profit = liq.liquidateWithPush(
+            address(oracle), _pushData(),
+            address(coll), address(debt), user, debtToCover, true, address(swapr), _swapData(seized, swapOut), 50e6
+        );
+        assertEq(oracle.pushes(), 1, "oracle push must run");
+        assertEq(profit, swapOut - debtToCover - (debtToCover * 4) / 10000, "profit unchanged by push");
+    }
+
+    /// A rejected push (someone else's landed first this block) must NOT block the liquidation:
+    /// the price is already fresh, the shot still fires.
+    function test_failedPushDoesNotBlockLiquidation() public {
+        MockOracleAdapter oracle = new MockOracleAdapter();
+        oracle.setBreakNext(true);
+        uint256 debtToCover = 1_000e6;
+        uint256 profit = liq.liquidateWithPush(
+            address(oracle), _pushData(),
+            address(coll), address(debt), user, debtToCover, true, address(swapr),
+            _swapData(debtToCover * 11, 1_100e6), 50e6
+        );
+        assertEq(oracle.pushes(), 0, "push was rejected");
+        assertGt(profit, 0, "liquidation must still succeed");
+    }
+
+    function test_zeroOracleTargetSkipsPush() public {
+        uint256 debtToCover = 1_000e6;
+        uint256 profit = liq.liquidateWithPush(
+            address(0), "",
+            address(coll), address(debt), user, debtToCover, true, address(swapr),
+            _swapData(debtToCover * 11, 1_100e6), 50e6
+        );
+        assertGt(profit, 0);
+    }
+
+    function test_liquidateWithPushOnlyOwner() public {
+        vm.prank(address(0xdead));
+        vm.expectRevert(HyperLendLiquidator.NotOwner.selector);
+        liq.liquidateWithPush(
+            address(0), "", address(coll), address(debt), user, 1e6, true, address(swapr), _swapData(1, 1), 0
+        );
     }
 }

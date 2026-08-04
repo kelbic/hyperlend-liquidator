@@ -794,13 +794,36 @@ def _run_check(rpc, st, now_ts=1_000_010.0):
 
 
 def test_check_pending_settles_a_win():
+    """04.08 («го»): a WIN refunds its provisional charge and books NOTHING — the prize repaid its
+    own gas inside the same tx. The cap bounds loss, not turnover; the old semantics (wins burn
+    budget) muted the bot after the first success of a cascade hour ($75-120 > the $50 day)."""
     st = _pending_state(gas_usd=0.5)
     _run_check(_FakeRcptRpc({_TXH: _rcpt("0x1")}), st)
     rec = st["sent"]["0xborrower"]
     assert rec["status"] == "ok", rec
     assert st["consec_reverts"] == 0
     assert st["reverts"] == 0
-    # provisional 0.5 undone, actual 1e6 gas * 1 gwei * HYPE_USD booked instead — ONCE
+    assert st["gas_usd"] == 0.0, f"win must refund its charge, got {st['gas_usd']}"
+
+
+def test_check_pending_win_counts_gas_with_legacy_flag():
+    """HL_CAP_COUNT_WINS=1 = откат: старая семантика, успех тоже жжёт суточный бюджет."""
+    st = _pending_state(gas_usd=0.5)
+    old = C.CAP_COUNT_WINS
+    C.CAP_COUNT_WINS = True
+    try:
+        _run_check(_FakeRcptRpc({_TXH: _rcpt("0x1")}), st)
+    finally:
+        C.CAP_COUNT_WINS = old
+    expected = 1_000_000 * 10 ** 9 / 1e18 * C.HYPE_USD
+    assert abs(st["gas_usd"] - expected) < 1e-9, st["gas_usd"]
+
+
+def test_check_pending_revert_books_actual_gas():
+    """A revert is the loss the cap exists to bound: the provisional charge is swapped for the
+    ACTUAL cost, never refunded."""
+    st = _pending_state(gas_usd=0.5)
+    _run_check(_FakeRcptRpc({_TXH: _rcpt("0x0")}), st)
     expected = 1_000_000 * 10 ** 9 / 1e18 * C.HYPE_USD
     assert abs(st["gas_usd"] - expected) < 1e-9, st["gas_usd"]
 
@@ -896,11 +919,12 @@ def test_gas_settle_after_the_utc_roll_cannot_go_negative():
 
 def test_gas_settle_undoes_the_provisional_charge_within_the_same_day():
     """The day guard must not break the normal case: same-day settle still swaps the estimate for
-    the real cost, so one shot is never charged twice."""
+    the real cost, so one shot is never charged twice. A REVERT is used so the booking stays
+    observable — a win refunds its charge entirely under the 04.08 cap semantics."""
     st = {"day": "2026-07-19", "gas_usd": 0.5, "consec_reverts": 0, "reverts": 0,
           "sent": {"0xb": {"ts": 1_000_000.0, "status": "pending", "tx": _TXH,
                            "gas_usd": 0.5, "gas_day": "2026-07-19"}}}
-    _run_check(_FakeRcptRpc({_TXH: _rcpt("0x1")}), st)
+    _run_check(_FakeRcptRpc({_TXH: _rcpt("0x0")}), st)
     assert abs(st["gas_usd"] - 1_000_000 * 10 ** 9 / 1e18 * C.HYPE_USD) < 1e-9, st["gas_usd"]
 
 
@@ -948,9 +972,9 @@ def test_receipt_without_effective_gas_price_falls_back_to_the_estimate():
     burned — the daily cap goes blind — where the same missing field on gasUsed correctly kept the
     estimate. Missing means unknown, not free."""
     st = _pending_state(gas_usd=0.42)
-    rcpt = {"status": "0x1", "gasUsed": hex(1_000_000), "blockNumber": "0x64"}
+    rcpt = {"status": "0x0", "gasUsed": hex(1_000_000), "blockNumber": "0x64"}
     _run_check(_FakeRcptRpc({_TXH: rcpt}), st)
-    assert st["sent"]["0xborrower"]["status"] == "ok"
+    assert st["sent"]["0xborrower"]["status"] == "revert"
     assert st["gas_usd"] == 0.42, f"gas silently zeroed: {st['gas_usd']}"
 
 
@@ -964,11 +988,15 @@ def test_integer_receipt_fields_are_parsed_not_treated_as_garbage():
     assert E._rcpt_status({"status": None}) is None      # and garbage is still garbage
     assert E._rcpt_status({"status": "junk"}) is None
     st = _pending_state(gas_usd=0.5)
-    _run_check(_FakeRcptRpc({_TXH: {"status": 1, "gasUsed": 1_000_000,
+    _run_check(_FakeRcptRpc({_TXH: {"status": 0, "gasUsed": 1_000_000,
                                     "effectiveGasPrice": 10 ** 9}}), st)
-    assert st["sent"]["0xborrower"]["status"] == "ok", st["sent"]
+    assert st["sent"]["0xborrower"]["status"] == "revert", st["sent"]
     expected = 1_000_000 * 10 ** 9 / 1e18 * C.HYPE_USD
     assert abs(st["gas_usd"] - expected) < 1e-9, st["gas_usd"]
+    st2 = _pending_state(gas_usd=0.5)
+    _run_check(_FakeRcptRpc({_TXH: {"status": 1, "gasUsed": 1_000_000,
+                                    "effectiveGasPrice": 10 ** 9}}), st2)
+    assert st2["sent"]["0xborrower"]["status"] == "ok", "int status 1 must still settle as a win"
 
 
 def test_reset_keeps_in_flight_records_so_their_receipts_still_settle():

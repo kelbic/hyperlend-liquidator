@@ -124,6 +124,11 @@ RPC_SLOW_SEC = float(os.environ.get("HL_RPC_SLOW_SEC", "3"))
 
 # kill-switch / dedup
 MAX_DAILY_GAS_USD = float(os.environ.get("HL_MAX_DAILY_GAS_USD", "5"))
+# 04.08 («го» владельца): кап ограничивает УБЫТОК, не оборот. Успешный выстрел окупает свой газ
+# призом в той же tx, поэтому его settle ВОЗВРАЩАЕТ заряд в суточный бюджет; в кап копятся только
+# реверты/потерянные. Старая семантика (успех тоже жёг бюджет) глушила бота после первого же
+# успеха каскадного часа (~$75-120 газа при base 375+ gwei > дневных $50). Откат = HL_CAP_COUNT_WINS=1.
+CAP_COUNT_WINS = os.environ.get("HL_CAP_COUNT_WINS", "0") == "1"
 MAX_CONSEC_REVERTS = int(os.environ.get("HL_MAX_CONSEC_REVERTS", "3"))
 DEDUP_SEC = float(os.environ.get("HL_DEDUP_SEC", "60"))
 # a REVERTED target must NOT be retried next pass (3 quick reverts on one bad target would trip
