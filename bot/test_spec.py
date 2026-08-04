@@ -270,10 +270,12 @@ def _spec_env(monkeypatch, plan_ret):
     monkeypatch.setattr(C, "CONTRACT", "0x" + "1" * 40)
     monkeypatch.setattr(C, "DRY_RUN", True)     # fire перехвачен; balance-гейт не дёргаем
     monkeypatch.setattr(spec, "plan", lambda acct, t: plan_ret)
-    monkeypatch.setattr(spec, "push_calldata", lambda p: b"\x01\x02")
     fired = []
-    monkeypatch.setattr(ex, "fire",
-                        lambda t, ev, st, now, gas, push=None: fired.append((t, ev, push)))
+    monkeypatch.setattr(
+        ex, "fire",
+        lambda t, ev, st, now, gas, push=None, spec_probe=False:
+            fired.append((t, ev, push, spec_probe)))
+    ex._spec_windows.clear()
     return fired
 
 
@@ -283,50 +285,97 @@ def _armed(borrower: str) -> None:
                             "ev": {"net_usd": 42.0}, "ts": time.monotonic()}
 
 
-def test_spec_pass_fires_armed_edge_target_with_push(monkeypatch):
-    plan = {"adapter": _A, "feeds": ["HYPE"], "hf_est": 0.98, "age_ms": 4_000, "pkgs": []}
-    fired = _spec_env(monkeypatch, plan)
+_PLAN = {"adapter": _A, "feeds": ["HYPE"], "hf_est": 0.98, "age_ms": 4_000, "pkgs": []}
+
+
+def test_spec_pass_probes_armed_edge_target_and_keeps_arm(monkeypatch):
+    """Потребитель: окно открыто (план есть) — уходит ЗОНД (spec_probe, БЕЗ пуша), а арм
+    ЖИВЁТ: окно кормится повторами зондов раз в блок до лендинга пуша релейера."""
+    fired = _spec_env(monkeypatch, _PLAN)
     b = "0x" + "77" * 20
     _armed(b)
     try:
         n = ex._spec_pass({b: _acct(1.005)}, {"sent": {}}, time.time(), 0.01)
+        assert n == 1 and len(fired) == 1
+        t, ev, push, probe = fired[0]
+        assert push is None, "потребитель не пушит — премисса self-push опровергнута форком"
+        assert probe is True, "выстрел обязан уйти зондом (низкий tip, spec-учёт)"
+        assert b in ex._prearm, "арм обязан пережить зонд — окно живёт повторами"
+        assert ex._spec_windows[b]["probes"] == 1
     finally:
         ex._prearm.clear()
-    assert n == 1 and len(fired) == 1
-    t, ev, push = fired[0]
-    assert push == (_A, b"\x01\x02"), "выстрел обязан уйти с пушем"
-    assert b not in ex._prearm, "использованный арм не смеет пережить выстрел"
+        ex._spec_windows.clear()
+
+
+def test_spec_pass_caps_probes_per_window(monkeypatch):
+    fired = _spec_env(monkeypatch, _PLAN)
+    b = "0x" + "77" * 20
+    _armed(b)
+    try:
+        for _ in range(C.SPEC_MAX_PROBES + 3):
+            ex._spec_pass({b: _acct(1.005)}, {"sent": {}}, time.time(), 0.01)
+        assert len(fired) == C.SPEC_MAX_PROBES, \
+            "кап зондов на окно обязан держать плотность конечной"
+    finally:
+        ex._prearm.clear()
+        ex._spec_windows.clear()
+
+
+def test_spec_pass_window_reopens_after_gap(monkeypatch):
+    """Пауза без плана дольше SPEC_WINDOW_GAP_S закрывает окно; следующее открывается со
+    СВЕЖИМ капом — исчерпанное окно не смеет навсегда глушить цель."""
+    fired = _spec_env(monkeypatch, _PLAN)
+    b = "0x" + "77" * 20
+    _armed(b)
+    try:
+        for _ in range(C.SPEC_MAX_PROBES + 3):
+            ex._spec_pass({b: _acct(1.005)}, {"sent": {}}, time.time(), 0.01)
+        assert len(fired) == C.SPEC_MAX_PROBES
+        # окно отжило: сдвигаем last за порог паузы — просроченное окно закрывается
+        ex._spec_windows[b]["last"] -= C.SPEC_WINDOW_GAP_S + 1
+        ex._spec_pass({b: _acct(1.005)}, {"sent": {}}, time.time(), 0.01)
+        assert len(fired) == C.SPEC_MAX_PROBES + 1, "новое окно — новый кап"
+        assert ex._spec_windows[b]["probes"] == 1
+    finally:
+        ex._prearm.clear()
+        ex._spec_windows.clear()
 
 
 def test_spec_pass_leaves_live_targets_to_reactive_path(monkeypatch):
-    """on-chain HF < 1 — жертва живая, её берёт process_targets; пуш там способен «вылечить»."""
-    fired = _spec_env(monkeypatch, {"adapter": _A, "feeds": ["HYPE"], "hf_est": 0.9,
-                                    "age_ms": 1_000, "pkgs": []})
+    """on-chain HF < 1 — пуш уже лёг, жертва живая: её берёт process_targets этой же итерации."""
+    fired = _spec_env(monkeypatch, {**_PLAN, "hf_est": 0.9})
     b = "0x" + "77" * 20
     _armed(b)
     try:
         n = ex._spec_pass({b: _acct(0.99)}, {"sent": {}}, time.time(), 0.01)
     finally:
         ex._prearm.clear()
+        ex._spec_windows.clear()
     assert n == 0 and not fired
 
 
-def test_spec_pass_respects_dedup(monkeypatch):
-    fired = _spec_env(monkeypatch, {"adapter": _A, "feeds": ["HYPE"], "hf_est": 0.98,
-                                    "age_ms": 1_000, "pkgs": []})
+def test_spec_pass_respects_reactive_dedup(monkeypatch):
+    """Pending РЕАКТИВНЫЙ выстрел по borrower (ключ без #pN) гейтит зонды: двух ликвидаций
+    одной цели не шлём. Собственные ключи зондов (borrower#pN) этот гейт не трогают."""
+    fired = _spec_env(monkeypatch, _PLAN)
     b = "0x" + "77" * 20
     _armed(b)
     st = {"sent": {b: {"ts": time.time(), "status": "pending"}}}
     try:
         n = ex._spec_pass({b: _acct(1.005)}, st, time.time(), 0.01)
+        assert n == 0 and not fired, "pending-выстрел держит цель до сеттла"
+        # прошлый ЗОНД pending — НЕ гейт: ключ уникален, окно живёт повторами
+        st2 = {"sent": {f"{b}#p1": {"ts": time.time(), "status": "pending", "spec": True}}}
+        ex._spec_windows.clear()
+        n2 = ex._spec_pass({b: _acct(1.005)}, st2, time.time(), 0.01)
+        assert n2 == 1, "зонд в полёте не смеет глушить следующий зонд"
     finally:
         ex._prearm.clear()
-    assert n == 0 and not fired, "pending-выстрел держит цель до сеттла"
+        ex._spec_windows.clear()
 
 
 def test_spec_pass_gated_off(monkeypatch):
-    fired = _spec_env(monkeypatch, {"adapter": _A, "feeds": ["HYPE"], "hf_est": 0.98,
-                                    "age_ms": 1_000, "pkgs": []})
+    fired = _spec_env(monkeypatch, _PLAN)
     monkeypatch.setattr(C, "SPEC_FIRE", False)
     b = "0x" + "77" * 20
     _armed(b)
@@ -334,4 +383,5 @@ def test_spec_pass_gated_off(monkeypatch):
         n = ex._spec_pass({b: _acct(1.005)}, {"sent": {}}, time.time(), 0.01)
     finally:
         ex._prearm.clear()
+        ex._spec_windows.clear()
     assert n == 0 and not fired, "HL_SPEC_FIRE=0 обязан быть полным откатом spec-пути"

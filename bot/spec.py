@@ -1,4 +1,13 @@
-"""Spec-fire: данные для атомарного self-push + ликвидации (liquidateWithPush, контракт v2).
+"""Spec-consumer: предсказание чужого пуша RedStone (04.08 — вторая жизнь слоя).
+
+Слой строился как self-push (liquidateWithPush), но форк-канарейка 04.08 опровергла премиссу
+«пуш пермишенлесс»: адаптер двигает цену только от авторизованных релейеров, чужой отправитель
+получает молчаливый no-op (см. bot/config.py §SPEC-CONSUMER). Кэши и математика остались тем
+же, изменилась интерпретация: девиация гейтвея >= 0.5% означает, что пуш РЕЛЕЙЕРА неизбежен
+(его собственный порог), а chain-кэш отвечает «пуш ещё не лёг» (gw строго новее хранимого).
+plan() теперь читается как «армленная цель станет ликвидируемой ГРЯДУЩИМ пушем релейера —
+окно открыто»; огневую часть (liquidate-зонды с низким tip в пуш-блок) держит _spec_pass
+executor'а.
 
 Роль модуля — держать два кэша тёплыми ВНЕ горячего пути и отвечать на один вопрос за
 микросекунды: «делает ли свежая подписанная цена гейтвея армленную цель ликвидируемой, и
@@ -163,9 +172,10 @@ def start() -> None:
             return
         _meta["started"] = True
     threading.Thread(target=_watch_loop, daemon=True, name="spec-watch").start()
-    print(f"  spec-watch started: {len(WATCH)} feeds / 2 adapters, "
+    print(f"  spec-watch started (consumer): {len(WATCH)} feeds / 2 adapters, "
           f"poll {C.SPEC_POLL_HOT}s hot / {C.SPEC_POLL_COLD}s cold, "
-          f"fire at HF_est < {C.SPEC_HF_FIRE}")
+          f"probe at HF_est < {C.SPEC_HF_FIRE}, tip {C.SPEC_TIP_GWEI} gwei, "
+          f"cap {C.SPEC_MAX_PROBES}/window")
 
 
 def set_hot(hot: bool) -> None:
@@ -230,9 +240,9 @@ def plan(acct: dict, t: dict) -> dict | None:
                             or g["ts_ms"] <= ch["ts_ms"]):
                         continue
                     sc = g["price"] * 1e8 / ch["value"]
-                    # Порог девиации адаптера (замер 04.08: принимаются только >= 0.5%).
-                    # Ниже порога апдейт — молчаливый no-op (status=1, цена на месте), а
-                    # выстрел по несдвинутой цене гарантированно ревертится по HF.
+                    # Порог девиации = порог релейера (замер 04.08: пуши только >= 0.5%).
+                    # Ниже порога пуша НЕ БУДЕТ — фид не масштабируется (его on-chain цена
+                    # не изменится) и окно от него не открывается.
                     if abs(sc - 1.0) < C.SPEC_MIN_DEVIATION:
                         continue
                     if is_coll:

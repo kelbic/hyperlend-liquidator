@@ -896,15 +896,25 @@ def _sign_args() -> list[str]:
     return ["--private-key", C.PRIVATE_KEY]
 
 
+_spec_seq = {"n": 0}    # сквозной номер зонда — уникальные ключи st["sent"] (borrower#pN)
+
+
 def fire(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
-         push: tuple[str, bytes] | None = None) -> None:
-    """push=(adapter, oracleCalldata) переключает вход контракта на liquidateWithPush —
-    спекулятивный выстрел по свежей подписанной цене (см. _spec_pass). Доступен только на
-    raw-пути: у cast-фолбэка нет формы для bytes-аргумента такого размера, и spec-проход
-    гейтится на C.RAW_TX — здесь пуш молча не теряем, а роняем выстрел с явной причиной."""
+         push: tuple[str, bytes] | None = None, spec_probe: bool = False) -> None:
+    """push=(adapter, oracleCalldata) переключает вход контракта на liquidateWithPush (энкодер
+    жив для тестов/будущего, но в бою мёртв: форк 04.08 доказал sender-гейт адаптера).
+    spec_probe=True — зонд потребителя (_spec_pass): обычный liquidate, но с фиксированным
+    низким tip (C.SPEC_TIP_GWEI — сесть в пуш-блок ПОСЛЕ пуша релейера), уникальным ключом
+    учёта (borrower#pN: зонды повторяются раз в блок и не смеют душить друг друга дедупом)
+    и пометкой rec["spec"] — реверт зонда ОЖИДАЕМ и не кормит consec_reverts. Оба режима
+    только для raw-пути: у cast-фолбэка нет ни bytes-формы, ни tip-переопределения."""
     key = t["borrower"]
+    if spec_probe:
+        _spec_seq["n"] += 1
+        key = f"{t['borrower']}#p{_spec_seq['n']}"
     nets = f"${ev['net_usd']:+,.1f}"
-    hdr = (f"{'PUSH ' if push else ''}HF={t['hf']:.4f} cf={t['close_factor']:.0%} "
+    hdr = (f"{'PUSH ' if push else ''}{'PROBE ' if spec_probe else ''}"
+           f"HF={t['hf']:.4f} cf={t['close_factor']:.0%} "
            f"{t['coll_sym']}->{t['debt_sym']} "
            f"cover={t['debt_to_cover']} net={nets} impact={ev['impact']*100:.2f}% "
            f"{t['borrower'][:10]}…")
@@ -912,17 +922,18 @@ def fire(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
         print(f"  DRY_RUN: would liquidate {hdr}; guard=DRY, NOT sent "
               f"(contract={'set' if C.CONTRACT else 'none'})")
         return
-    if push and not C.RAW_TX:
-        print(f"  spec: пуш требует HL_RAW_TX=1 — выстрел {key[:10]}… отменён")
+    if (push or spec_probe) and not C.RAW_TX:
+        print(f"  spec: путь требует HL_RAW_TX=1 — выстрел {key[:10]}… отменён")
         return
     if C.RAW_TX:
-        _fire_raw(t, ev, st, now_ts, gas_usd, key, hdr, push)
+        _fire_raw(t, ev, st, now_ts, gas_usd, key, hdr, push, spec_probe)
     else:
         _fire_cast(t, ev, st, now_ts, gas_usd, key, hdr)
 
 
 def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
-              key: str, hdr: str, push: tuple[str, bytes] | None = None) -> None:
+              key: str, hdr: str, push: tuple[str, bytes] | None = None,
+              spec_probe: bool = False) -> None:
     """HL_RAW_TX=1: encode -> sign -> broadcast -> RETURN. No receipt wait, ever. The tx is filed
     as "pending" and settled by _check_pending() on a later pass, so the next target in a cascade
     is evaluated immediately instead of ~4.4s later."""
@@ -930,7 +941,10 @@ def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
     try:
         calldata = (_encode_liquidate_push(t, ev, *push) if push
                     else _encode_liquidate(t, ev))
-        txh = _sign_and_send(calldata, tip_wei=_tip_wei(ev.get("net_usd"), st))
+        # Зонд НЕ торгуется за место аукционным tip'ом: его место — ПОСЛЕ пуша релейера,
+        # то есть НИЖЕ релейерского tip'а (полоса замерена, см. config.SPEC_TIP_GWEI).
+        tip = int(C.SPEC_TIP_GWEI * 1e9) if spec_probe else _tip_wei(ev.get("net_usd"), st)
+        txh = _sign_and_send(calldata, tip_wei=tip)
     except SendAmbiguous as e:
         # DELIVERY UNKNOWN — book it exactly like a successful send. A tx we cannot rule out is
         # live must be tracked: untracked, its gas escapes the daily cap, a revert never reaches
@@ -956,10 +970,15 @@ def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
     # charge into the fresh day's budget (see _settle_gas).
     st["gas_usd"] += gas_usd
     st["sent"][key] = {"ts": now_ts, "status": "pending", "tx": txh, "gas_usd": gas_usd,
-                       "gas_day": st.get("day")}
+                       "gas_day": st.get("day"), **({"spec": True} if spec_probe else {})}
     # Alert AFTER the broadcast and fire-and-forget: Telegram must never sit between the
     # liquidation decision and the wire, nor delay the next shot in a cascade.
-    alert_async(f"🔫 LIQUIDATE {hdr}, sent: {txh}{maybe}")
+    # Зонды — в лог, не в TG (до 12 на окно, исход = ✅/реверт в _check_pending; алерт
+    # только там, где нужен человек — победа алертится как обычный ✅ liq ok).
+    if spec_probe:
+        print(f"  🔫 probe sent {hdr}: {txh}{maybe}")
+    else:
+        alert_async(f"🔫 LIQUIDATE {hdr}, sent: {txh}{maybe}")
 
 
 def _fire_cast(t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float,
@@ -1127,11 +1146,25 @@ def _check_pending(rpc: Rpc, st: dict, now_ts: float) -> None:
                 print(f"  pending {txh[:14]}…: unparsable receipt status; retrying next pass")
                 continue
             actual = _settle_gas(st, rec, rcpt, status)
+            spec_rec = bool(rec.get("spec"))
             if status == 1:
                 st["consec_reverts"] = 0
                 for k in keys:
-                    st["sent"][k] = {"ts": rec["ts"], "status": "ok", "tx": txh}
-                alert_async(f"✅ liq ok {txh} (gas ${actual:.4f})")
+                    st["sent"][k] = {"ts": rec["ts"], "status": "ok", "tx": txh,
+                                     **({"spec": True} if spec_rec else {})}
+                alert_async(f"✅ liq ok{' (spec probe — взят пуш-блок)' if spec_rec else ''} "
+                            f"{txh} (gas ${actual:.4f})")
+            elif spec_rec:
+                # Реверт зонда ОЖИДАЕМ (блок без пуша релейера): не кормит consec_reverts —
+                # три зонда подряд сняли бы бота kill-switch'ем ровно в окно транзита. Газ
+                # уже в дневном капе (_settle_gas), счётчик reverts честен, канал — лог:
+                # исход окна и так виден (✅ или «window closed»), человеку тут делать нечего.
+                st["reverts"] += 1
+                for k in keys:
+                    st["sent"][k] = {"ts": rec["ts"], "status": "revert", "tx": txh,
+                                     "spec": True}
+                print(f"  probe revert (ожидаемо, блок без пуша) {txh[:14]}… "
+                      f"(gas ${actual:.4f})")
             else:
                 st["consec_reverts"] += 1
                 st["reverts"] += 1
@@ -1325,14 +1358,28 @@ def process_targets(rpc: Rpc, targets: list, st: dict, now_ts: float, gas_usd: f
 _spec_stale_warn = {"ts": 0.0}
 
 
+# Окна потребителя: borrower -> {"first","last" (monotonic), "probes"}. Окно живёт, пока
+# spec.plan() возвращает план (девиация >= порога релейера И chain не догнал гейтвей), и
+# закрывается паузой SPEC_WINDOW_GAP_S. Кап SPEC_MAX_PROBES — на окно, не на цель навсегда.
+_spec_windows: dict = {}
+
+
 def _spec_pass(accounts: dict, st: dict, now_ts: float, gas_usd: float) -> int:
-    """Спекулятивный проход (04.08): армленные цели у кромки, у которых свежая ПОДПИСАННАЯ
-    цена гейтвея даёт HF_est < C.SPEC_HF_FIRE, стреляются через liquidateWithPush — пуш этой
-    самой цены и ликвидация одной транзакцией (lag=0, техника единственного оператора тихого
-    поля). On-chain HF >= 1 обязателен: HF < 1 берёт реактивный путь этой же итерации, и пуш
-    там способен «вылечить» жертву нашей же свежей ценой. Промах оценки стоит одного реверта
-    (HF-чек liquidationCall + on-chain min_profit) и учитывается kill-switch'ем как любой
-    промах; повторы душит recently_fired (pending -> DEDUP/REVERT_COOLDOWN)."""
+    """Потребитель чужого пуша (04.08, вторая жизнь слоя после опровержения self-push).
+
+    Девиация гейтвея >= 0.5% обязывает РЕЛЕЙЕРА запушить (его собственный порог); пуш ложится
+    через 2.5-7с после подписи пакета — мы видим ту же девиацию раньше лендинга. Пока окно
+    открыто, каждый hot-проход шлёт ОБЫЧНЫЙ liquidate-зонд с tip=C.SPEC_TIP_GWEI: малые блоки
+    упорядочены по tip убыванию, и зонд с tip ниже релейерского в пуш-блоке исполняется ПОСЛЕ
+    пуша — ликвидация в самом блоке транзита (lag=0). Зонд в блоке без пуша ревертится на
+    HF-чеке (~211k газа ~$0.001, форк-замер) — ожидаемая цена плотности: consec_reverts их
+    НЕ считает (rec["spec"] в _check_pending), дневной газ-кап учитывает полностью.
+
+    On-chain HF >= 1 обязателен: HF < 1 (пуш уже лёг) берёт реактивный путь этой же итерации.
+    Арм НЕ снимается зондом — окно живёт повторами; победа сама закрывает и окно (позиция
+    закрыта -> HF-гейт), и арм (PREARM_TTL/prearm_tick). Ключи зондов в st["sent"] уникальны
+    (borrower#pN), так что реактивный дедуп по borrower они не трогают; настоящий реактивный
+    выстрел (recently_fired по borrower) зонды ГЕЙТИТ — двух ликвидаций одной цели не шлём."""
     if not (C.SPEC_FIRE and C.RAW_TX and C.CONTRACT):
         return 0
     with _prearm_lock:
@@ -1342,31 +1389,37 @@ def _spec_pass(accounts: dict, st: dict, now_ts: float, gas_usd: float) -> int:
         if msg and time.monotonic() - _spec_stale_warn["ts"] > 300:
             _spec_stale_warn["ts"] = time.monotonic()
             print(f"  ⚠️ spec {msg} — кромка армлена, спекулятивный слой слеп")
+    now_mono = time.monotonic()
+    for b in list(_spec_windows):
+        if now_mono - _spec_windows[b]["last"] > C.SPEC_WINDOW_GAP_S:
+            w = _spec_windows.pop(b)
+            print(f"  spec window closed {b[:10]}…: {w['probes']} зондов "
+                  f"за {now_mono - w['first']:.1f}с")
     n = 0
     for b, rec in armed:
         acct = accounts.get(b)
-        if acct is None or time.monotonic() - rec["ts"] > C.PREARM_TTL:
+        if acct is None or now_mono - rec["ts"] > C.PREARM_TTL:
             continue
         hf = acct["health_factor"] / 1e18
         if not (1.0 <= hf < C.PREARM_HF):
             continue
-        if recently_fired(st, b, now_ts):
-            continue
         p = spec.plan(acct, rec["t"])
         if p is None:
             continue
-        try:
-            cd = spec.push_calldata(p)
-        except Exception as e:          # noqa: BLE001 — битый payload не смеет ронять итерацию
-            print(f"  spec payload {b[:10]}…: {e}")
+        w = _spec_windows.setdefault(b, {"first": now_mono, "last": now_mono, "probes": 0})
+        w["last"] = now_mono
+        if w["probes"] >= C.SPEC_MAX_PROBES:
             continue
-        print(f"  🎯 SPEC {b[:10]}… HF={hf:.4f} est={p['hf_est']:.4f} "
-              f"push {'+'.join(p['feeds'])}@{p['adapter'][:10]}… age={p['age_ms']/1000:.1f}s")
+        if recently_fired(st, b, now_ts):
+            continue        # реактивный выстрел по цели в полёте/остывает — зонд не дублирует
         if not C.DRY_RUN and not check_balance(st, now_ts, force=True):
             print(f"  spec skip {b[:10]}… — недостаточно газа на EOA (см. ⛽-алерт)")
             break
-        fire(rec["t"], rec["ev"], st, now_ts, gas_usd, push=(p["adapter"], cd))
-        _prearm_drop(b)     # использованный арм не смеет пережить свой выстрел
+        w["probes"] += 1
+        print(f"  🎯 probe #{w['probes']} {b[:10]}… HF={hf:.4f} est={p['hf_est']:.4f} "
+              f"ждём push {'+'.join(p['feeds'])}@{p['adapter'][:10]}… "
+              f"age={p['age_ms']/1000:.1f}s tip={C.SPEC_TIP_GWEI}")
+        fire(rec["t"], rec["ev"], st, now_ts, gas_usd, spec_probe=True)
         n += 1
     return n
 
@@ -1448,6 +1501,10 @@ def _hot_iteration(rpc: Rpc, book: dict, st: dict, hs: dict, gas_usd: float,
     if n_upd:
         do_sweep = False
         print(f"  ⚡ oracle-upd x{n_upd}: hot-only проход")
+    # Открытое spec-окно = зонд обязан уходить ~раз в блок: чанк курсора раздувает итерацию
+    # до 2-3с (замер по логу) и дырявит покрытие пуш-блока — плотность и есть выигрыш.
+    if _spec_windows:
+        do_sweep = False
     if do_sweep:
         chunk, new_cursor, wrapped = next_chunk(borrowers, hs["cursor"], C.SWEEP_CHUNK)
     else:
@@ -1466,9 +1523,9 @@ def _hot_iteration(rpc: Rpc, book: dict, st: dict, hs: dict, gas_usd: float,
                                 retries=1)
         fired = process_targets(rpc, targets, st, now_ts, gas_usd)
 
-    # spec-fire ПОСЛЕ реактивного прохода: живые HF<1 уже отработаны, теперь кромка.
-    # Спекулятивно выстреленные из hot-set НЕ выпадают: on-chain они ещё HF>=1, и если наш
-    # пуш-tx не долетит, реактивный путь обязан их видеть; повторы душит recently_fired.
+    # spec-потребитель ПОСЛЕ реактивного прохода: живые HF<1 уже отработаны, теперь кромка.
+    # Прозондированные цели из hot-set НЕ выпадают: on-chain они ещё HF>=1, и когда пуш
+    # релейера ляжет без нашего зонда в блоке, реактивный путь обязан взять их следом.
     spec_n = 0
     if C.SPEC_FIRE and (ok or C.DRY_RUN):
         try:
@@ -1654,8 +1711,10 @@ def loop() -> None:
             print(f"  shadow tick err: {e}")
         save_state(st)
         save_hotset(hs)
-        # после апдейта цены не спать полный интервал: транзиты HF доигрываются 1-3 блока
-        time.sleep(0.05 if status.get("oracle_upd") else C.HOT_POLL_SEC)
+        # после апдейта цены не спать полный интервал: транзиты HF доигрываются 1-3 блока;
+        # ушедшие зонды — тот же режим: следующий зонд должен успеть в следующий блок
+        time.sleep(0.05 if (status.get("oracle_upd") or status.get("spec"))
+                   else C.HOT_POLL_SEC)
 
 
 def main() -> None:

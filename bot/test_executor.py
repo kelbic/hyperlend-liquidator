@@ -522,6 +522,34 @@ def test_fire_with_push_refuses_cast_path():
     assert st["fires"] == 0 and not st["sent"], "выстрел отменён целиком"
 
 
+def test_fire_spec_probe_uses_band_tip_unique_key_and_flag():
+    """Зонд потребителя (04.08): tip = ПОЛОСА (C.SPEC_TIP_GWEI — сесть ПОСЛЕ пуша релейера,
+    не аукцион _tip_wei), ключ учёта уникален (borrower#pN — зонды раз в блок не смеют
+    душить друг друга), запись несёт spec=True (реверт ожидаем, consec_reverts мимо)."""
+    seen = {}
+    o = _armed_raw(_FakeWrite())
+    o_sign = E._sign_and_send
+    E._sign_and_send = (lambda cd, tip_wei=None:
+                        seen.setdefault("tip", tip_wei) or "0x" + "e" * 64)
+    st = _fresh_state()
+    try:
+        E.fire(dict(_T), dict(_EV), st, 1_000_000.0, 0.01, spec_probe=True)
+        E._sign_and_send = (lambda cd, tip_wei=None:
+                            seen.setdefault("tip2", tip_wei) or "0x" + "d" * 64)
+        E.fire(dict(_T), dict(_EV), st, 1_000_001.0, 0.01, spec_probe=True)
+    finally:
+        E._sign_and_send = o_sign
+        _restore_raw(o)
+    assert seen["tip"] == int(C.SPEC_TIP_GWEI * 1e9), "зонд обязан идти с tip'ом полосы"
+    keys = [k for k in st["sent"] if k.startswith(_T["borrower"] + "#p")]
+    assert len(keys) == 2 and keys[0] != keys[1], "у каждого зонда свой ключ учёта"
+    for k in keys:
+        assert st["sent"][k]["spec"] is True and st["sent"][k]["status"] == "pending"
+    assert _T["borrower"] not in st["sent"], "ключ borrower остаётся реактивному пути"
+    assert st["fires"] == 2 and abs(st["gas_usd"] - 0.02) < 1e-12, \
+        "учёт зонда бит-в-бит с обычным выстрелом (кроме ключа и tip)"
+
+
 # ------------------------------------------------------------------- sign + broadcast
 _TEST_KEY = "0x" + "11" * 32
 _TEST_CONTRACT = "0x" + "1" * 40
@@ -958,6 +986,34 @@ def test_check_pending_settles_a_revert_and_feeds_the_kill_switch():
     assert st["sent"]["0xborrower"]["status"] == "revert"
     assert st["consec_reverts"] == 1
     assert st["reverts"] == 1
+
+
+def test_check_pending_spec_probe_revert_skips_consec_but_books_gas():
+    """Реверт ЗОНДА (rec["spec"]) ожидаем — блок без пуша релейера: consec_reverts НЕ растёт
+    (три зонда подряд сняли бы бота kill-switch'ем ровно в окно транзита), но газ книжится
+    фактом и общий счётчик reverts честен. Обычный реверт в том же проходе продолжает
+    кормить kill-switch как раньше — пометка сужена до spec-записей."""
+    st = _pending_state(gas_usd=0.5)
+    st["sent"]["0xborrower"]["spec"] = True
+    _run_check(_FakeRcptRpc({_TXH: _rcpt("0x0")}), st)
+    rec = st["sent"]["0xborrower"]
+    assert rec["status"] == "revert" and rec.get("spec") is True
+    assert st["consec_reverts"] == 0, "ожидаемый реверт зонда не смеет кормить kill-switch"
+    assert st["reverts"] == 1
+    expected = 1_000_000 * 10 ** 9 / 1e18 * C.HYPE_USD
+    assert abs(st["gas_usd"] - expected) < 1e-9, "газ зонда книжится фактом, как у всех"
+
+
+def test_check_pending_spec_probe_win_settles_ok():
+    """Победа зонда = обычный ✅: провизия возвращается (выигрыш оплатил газ внутри tx),
+    consec_reverts сброшен, запись несёт spec для журнала."""
+    st = _pending_state(gas_usd=0.5)
+    st["sent"]["0xborrower"]["spec"] = True
+    st["consec_reverts"] = 2
+    _run_check(_FakeRcptRpc({_TXH: _rcpt("0x1")}), st)
+    rec = st["sent"]["0xborrower"]
+    assert rec["status"] == "ok" and rec.get("spec") is True
+    assert st["consec_reverts"] == 0 and st["gas_usd"] == 0.0
 
 
 def test_check_pending_charges_gas_exactly_once_per_tx():
