@@ -230,6 +230,11 @@ def plan(acct: dict, t: dict) -> dict | None:
                             or g["ts_ms"] <= ch["ts_ms"]):
                         continue
                     sc = g["price"] * 1e8 / ch["value"]
+                    # Порог девиации адаптера (замер 04.08: принимаются только >= 0.5%).
+                    # Ниже порога апдейт — молчаливый no-op (status=1, цена на месте), а
+                    # выстрел по несдвинутой цене гарантированно ревертится по HF.
+                    if abs(sc - 1.0) < C.SPEC_MIN_DEVIATION:
+                        continue
                     if is_coll:
                         s_c *= sc
                     else:

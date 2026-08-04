@@ -112,6 +112,23 @@ def test_validated_median_price(signers):
 
 
 # --------------------------------------------------------------------------- plan()
+def test_plan_ignores_feed_below_adapter_deviation_threshold(caches):
+    """04.08 форк-канарейка: адаптер принимает апдейт только при |Δцены| >= 0.5% (замер по
+    истории: 0.501/0.504/0.507/0.508%, ничего ниже). Пуш ниже порога — МОЛЧАЛИВЫЙ no-op
+    (status=1, цена на месте), значит выстрел по нему ревертится по HF. Такой фид не смеет
+    ни попадать в пуш, ни давать масштаб."""
+    now_ms = int(time.time() * 1000)
+    with spec._lock:
+        spec._gw["HYPE"] = _feed_cache("HYPE", 50.0 * 0.996, now_ms - 5_000)   # −0.4%: мимо порога
+        spec._chain[(_A, "HYPE")] = {"value": int(50.0 * 1e8), "ts_ms": now_ms - 240_000}
+    assert spec.plan(_acct(1.001), _t(_WHYPE, _USDT0)) is None
+    # тот же расклад, но движение выше порога — план появляется
+    with spec._lock:
+        spec._gw["HYPE"] = _feed_cache("HYPE", 50.0 * 0.99, now_ms - 5_000)    # −1%
+    p = spec.plan(_acct(1.001), _t(_WHYPE, _USDT0))
+    assert p is not None and p["feeds"] == ["HYPE"]
+
+
 def test_plan_fires_on_collateral_price_drop(caches):
     """WHYPE-залог падает на 3% по свежему пакету: HF 1.01 -> est ~0.98 < порога, пуш HYPE@A."""
     now_ms = int(time.time() * 1000)
@@ -153,10 +170,11 @@ def test_plan_wsthype_composes_two_feeds(caches):
         spec._chain[(_A, "USDT")] = {"value": int(1.0 * 1e8), "ts_ms": now_ms - 240_000}
     p = spec.plan(_acct(1.01), _t(_WSTHYPE, _USDT0))
     assert p is not None
-    assert sorted(p["feeds"]) == ["HYPE", "USDT", "wstHYPE_FUNDAMENTAL"]
+    # USDT не двигается вовсе (0%) — ниже порога адаптера, в пуш не кладётся
+    assert sorted(p["feeds"]) == ["HYPE", "wstHYPE_FUNDAMENTAL"]
     est = 1.01 * (48.5 / 50.0) * (1.02 / 1.03)
     assert p["hf_est"] == pytest.approx(est, rel=1e-6)
-    assert len(p["pkgs"]) == 9
+    assert len(p["pkgs"]) == 6
 
 
 def test_plan_unmapped_asset_is_none(caches):
