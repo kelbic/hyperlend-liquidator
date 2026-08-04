@@ -235,6 +235,18 @@ SPEC_MAX_AGE_MS = int(os.environ.get("HL_SPEC_MAX_AGE_MS", "30000"))
 # cold — кромка пуста, кэш греется вполсилы (полный снапшот гейтвея ~350KB gzip за тик).
 SPEC_POLL_HOT = float(os.environ.get("HL_SPEC_POLL_HOT", "1.5"))
 SPEC_POLL_COLD = float(os.environ.get("HL_SPEC_POLL_COLD", "10"))
+# Очередь зондов при мультитранзите (уточнение kelbic 04.08): один пуш может открыть НЕСКОЛЬКО
+# целей, а зонд — один на блок, значит порядок целей в окне решает деньги. 1 — за проход
+# стреляет только цель с максимальным net, остальные ждут следующего блока (их окна открыты
+# и кормятся планом, кап топ-цели передаёт очередь дальше). ОТКАТ: HL_SPEC_QUEUE=0 (веер —
+# зонд каждой цели с планом за проход).
+SPEC_QUEUE = os.environ.get("HL_SPEC_QUEUE", "1") == "1"
+# Дрейф tip'а релейера (уточнение kelbic 04.08): полоса SPEC_TIP_GWEI — равновесие на СЕГОДНЯ;
+# если после наших побед в общем блоке релейер поднимет tip, это видно по его перцентилям за
+# недели до проигранной tip-войны. Вотчер пишет каждый замеченный пуш (продвижение chain-ts в
+# _tick_chain) в JSONL; сводка по неделям — analysis/tip_drift.py. Ответ на подъём ряда — не
+# гонка вверх, а пересчёт полосы под новый ряд. ОТКАТ: HL_SPEC_TIP_LOG= (пустая строка).
+SPEC_TIP_LOG = os.environ.get("HL_SPEC_TIP_LOG", os.path.join(DATA_DIR, "relayer_tips.jsonl"))
 
 STATE_FILE = os.path.expanduser(os.environ.get("HL_STATE", "~/.hyperlend-bot/state.json"))
 LOCK_FILE = os.path.expanduser(os.environ.get("HL_LOCK", "~/.hyperlend-bot/executor.lock"))

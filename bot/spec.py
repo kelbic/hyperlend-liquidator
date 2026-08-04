@@ -39,6 +39,8 @@ on-chain гейтами контракта. Позиция coll==debt самог
 """
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 
@@ -141,9 +143,61 @@ def _tick_chain(rpc: Rpc) -> None:
         raw = ret[2:]
         # getLastUpdateDetails -> (lastDataTimestamp МИЛЛИСЕКУНДЫ, lastBlockTimestamp, lastValue)
         upd[(a, f)] = {"ts_ms": int(raw[0:64], 16), "value": int(raw[128:192], 16)}
+    adv: list[tuple[str, str]] = []
     with _lock:
+        for k, v in upd.items():
+            old = _chain.get(k)
+            if old and v["ts_ms"] > old["ts_ms"]:
+                adv.append(k)               # продвижение хранимого ts = лендинг пуша релейера
         _chain.update(upd)
         _meta["chain_mono"] = time.monotonic()
+    if adv and C.SPEC_TIP_LOG:
+        try:
+            _log_push_tips(rpc, adv)
+        except Exception:   # noqa: BLE001 — телеметрия не смеет портить ни кэш, ни диагноз err
+            pass
+
+
+_tip_seen: set = set()      # tx-хэши уже записанных пушей (один пуш двигает несколько фидов)
+
+
+def _log_push_tips(rpc: Rpc, advanced: list[tuple[str, str]]) -> None:
+    """Дрейф tip'а релейера: полоса C.SPEC_TIP_GWEI — равновесие, живое лишь пока релейер
+    сидит на своём ряду tip'ов (04.08: p10=0.05 p50=1.5 p90=9.9). Каждое продвижение chain-ts
+    = его пуш; достаём tx из последних блоков и пишем tip в C.SPEC_TIP_LOG (JSONL, ~26 строк/
+    час). Перцентили по неделям — analysis/tip_drift.py; подъём ряда виден за недели до
+    tip-войны, и ответ на него — пересчёт полосы, не слепая гонка вверх. Живёт в вотчер-треде
+    ВНЕ горячего пути: к моменту детекта chain догнал гейтвей, окно этих фидов уже закрыто."""
+    latest = int(rpc.call("eth_blockNumber", []), 16)
+    logs = rpc.call("eth_getLogs", [{
+        "fromBlock": hex(max(0, latest - 40)), "toBlock": "latest",
+        "address": sorted({a for a, _ in advanced})}])
+    blocks: dict = {}
+    rows: list[dict] = []
+    for txh in {lg["transactionHash"] for lg in logs}:
+        if txh in _tip_seen:
+            continue
+        tx = rpc.call("eth_getTransactionByHash", [txh])
+        rc = rpc.call("eth_getTransactionReceipt", [txh])
+        if not tx or not rc:
+            continue
+        bn = int(rc["blockNumber"], 16)
+        if bn not in blocks:
+            blocks[bn] = rpc.call("eth_getBlockByNumber", [hex(bn), False])
+        base = int(blocks[bn].get("baseFeePerGas", "0x0"), 16)
+        rows.append({"ts": int(blocks[bn]["timestamp"], 16), "block": bn, "tx": txh,
+                     "adapter": (tx.get("to") or "").lower(), "from": tx["from"].lower(),
+                     "tip_gwei": round((int(rc["effectiveGasPrice"], 16) - base) / 1e9, 4),
+                     "base_gwei": round(base / 1e9, 4),
+                     "gas": int(rc["gasUsed"], 16), "st": int(rc["status"], 16)})
+        _tip_seen.add(txh)
+    if len(_tip_seen) > 8192:
+        _tip_seen.clear()
+    if rows:
+        os.makedirs(os.path.dirname(C.SPEC_TIP_LOG) or ".", exist_ok=True)
+        with open(C.SPEC_TIP_LOG, "a") as f:
+            for r in sorted(rows, key=lambda r: r["block"]):
+                f.write(json.dumps(r) + "\n")
 
 
 def _watch_loop() -> None:

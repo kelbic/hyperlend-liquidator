@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 
 import pytest
@@ -279,10 +280,10 @@ def _spec_env(monkeypatch, plan_ret):
     return fired
 
 
-def _armed(borrower: str) -> None:
+def _armed(borrower: str, net: float = 42.0) -> None:
     ex._prearm[borrower] = {"t": {"borrower": borrower, "coll_asset": _WHYPE,
                                   "debt_asset": _USDT0},
-                            "ev": {"net_usd": 42.0}, "ts": time.monotonic()}
+                            "ev": {"net_usd": net}, "ts": time.monotonic()}
 
 
 _PLAN = {"adapter": _A, "feeds": ["HYPE"], "hf_est": 0.98, "age_ms": 4_000, "pkgs": []}
@@ -374,6 +375,64 @@ def test_spec_pass_respects_reactive_dedup(monkeypatch):
         ex._spec_windows.clear()
 
 
+def test_spec_pass_queue_fires_top_net_only_per_pass(monkeypatch):
+    """Мультитранзит (уточнение kelbic 04.08): зонд один на блок — за проход стреляет цель
+    с максимальным net, вторая ЖДЁТ следующего блока, но окно её уже открыто и живёт."""
+    fired = _spec_env(monkeypatch, _PLAN)
+    monkeypatch.setattr(C, "SPEC_QUEUE", True)
+    b1, b2 = "0x" + "77" * 20, "0x" + "88" * 20
+    _armed(b1, net=10.0)
+    _armed(b2, net=100.0)
+    accounts = {b1: _acct(1.005), b2: _acct(1.005)}
+    try:
+        n = ex._spec_pass(accounts, {"sent": {}}, time.time(), 0.01)
+        assert n == 1 and len(fired) == 1
+        assert fired[0][0]["borrower"] == b2, "очередь обязана начинать с максимального net"
+        assert b1 in ex._spec_windows and b2 in ex._spec_windows, \
+            "окно ждущей цели открыто — она в очереди, не забыта"
+        assert ex._spec_windows[b1]["probes"] == 0
+        # следующий блок: топ всё ещё топ — стреляет снова он
+        ex._spec_pass(accounts, {"sent": {}}, time.time(), 0.01)
+        assert [f[0]["borrower"] for f in fired] == [b2, b2]
+    finally:
+        ex._prearm.clear()
+        ex._spec_windows.clear()
+
+
+def test_spec_pass_queue_advances_when_top_capped(monkeypatch):
+    """Кап топ-цели передаёт очередь второй — исчерпанное окно не глушит остальных."""
+    fired = _spec_env(monkeypatch, _PLAN)
+    monkeypatch.setattr(C, "SPEC_QUEUE", True)
+    b1, b2 = "0x" + "77" * 20, "0x" + "88" * 20
+    _armed(b1, net=10.0)
+    _armed(b2, net=100.0)
+    accounts = {b1: _acct(1.005), b2: _acct(1.005)}
+    try:
+        for _ in range(C.SPEC_MAX_PROBES):
+            ex._spec_pass(accounts, {"sent": {}}, time.time(), 0.01)
+        assert all(f[0]["borrower"] == b2 for f in fired), "до капа очередь держит топ"
+        ex._spec_pass(accounts, {"sent": {}}, time.time(), 0.01)
+        assert fired[-1][0]["borrower"] == b1, "после капа топ-цели стреляет следующая"
+    finally:
+        ex._prearm.clear()
+        ex._spec_windows.clear()
+
+
+def test_spec_pass_fanout_rollback(monkeypatch):
+    """ОТКАТ HL_SPEC_QUEUE=0: веерный режим — зонд каждой цели с планом за один проход."""
+    fired = _spec_env(monkeypatch, _PLAN)
+    monkeypatch.setattr(C, "SPEC_QUEUE", False)
+    b1, b2 = "0x" + "77" * 20, "0x" + "88" * 20
+    _armed(b1, net=10.0)
+    _armed(b2, net=100.0)
+    try:
+        n = ex._spec_pass({b1: _acct(1.005), b2: _acct(1.005)}, {"sent": {}}, time.time(), 0.01)
+        assert n == 2 and len(fired) == 2
+    finally:
+        ex._prearm.clear()
+        ex._spec_windows.clear()
+
+
 def test_spec_pass_gated_off(monkeypatch):
     fired = _spec_env(monkeypatch, _PLAN)
     monkeypatch.setattr(C, "SPEC_FIRE", False)
@@ -385,3 +444,77 @@ def test_spec_pass_gated_off(monkeypatch):
         ex._prearm.clear()
         ex._spec_windows.clear()
     assert n == 0 and not fired, "HL_SPEC_FIRE=0 обязан быть полным откатом spec-пути"
+
+
+# --------------------------------------------------------------------------- tip-drift
+def _last_upd_ret(ts_ms: int, value: int) -> str:
+    """Возврат getLastUpdateDetails: (lastDataTimestamp ms, lastBlockTimestamp, lastValue)."""
+    return "0x" + f"{ts_ms:064x}" + "0" * 64 + f"{value:064x}"
+
+
+def test_tick_chain_detects_push_advance(monkeypatch, caches):
+    """Продвижение chain-ts фида = лендинг пуша релейера: вотчер обязан отдать его в tip-лог
+    (дрейф полосы — уточнение kelbic 04.08). Первый тик прошлого не знает — пуш не фиксируется,
+    повторный тик без продвижения — тоже."""
+    logged = []
+    monkeypatch.setattr(spec, "_log_push_tips", lambda rpc, adv: logged.append(sorted(adv)))
+    monkeypatch.setattr(C, "SPEC_TIP_LOG", "/dev/null")
+    ts1 = 1_000_000_000_000
+    monkeypatch.setattr(spec, "multicall",
+                        lambda rpc, calls, retries=1: [(True, _last_upd_ret(ts1, 5 * 10 ** 9))] * len(calls))
+    spec._tick_chain(object())
+    assert not logged, "первый тик не знает прошлого — это не пуш"
+    spec._tick_chain(object())
+    assert not logged, "тот же ts — пуша не было"
+    monkeypatch.setattr(spec, "multicall",
+                        lambda rpc, calls, retries=1: [(True, _last_upd_ret(ts1 + 60_000, 5 * 10 ** 9))] * len(calls))
+    spec._tick_chain(object())
+    assert len(logged) == 1 and len(logged[0]) == len(spec.WATCH)
+    # выключенный лог (ОТКАТ HL_SPEC_TIP_LOG=) не зовёт логгер вовсе
+    monkeypatch.setattr(C, "SPEC_TIP_LOG", "")
+    monkeypatch.setattr(spec, "multicall",
+                        lambda rpc, calls, retries=1: [(True, _last_upd_ret(ts1 + 120_000, 5 * 10 ** 9))] * len(calls))
+    spec._tick_chain(object())
+    assert len(logged) == 1
+
+
+class _TipRpc:
+    """Канонические ответы под _log_push_tips: один пуш-tx релейера в блоке 999."""
+    BASE = 100_000_000                       # 0.1 gwei
+    TIP = 1_500_000_000                      # 1.5 gwei
+
+    def call(self, method, params):
+        if method == "eth_blockNumber":
+            return hex(1000)
+        if method == "eth_getLogs":
+            return [{"transactionHash": "0xab" * 16, "blockNumber": hex(999)}]
+        if method == "eth_getTransactionByHash":
+            return {"to": spec.ADAPTER_A,
+                    "from": "0xE08496b4000000000000000000000000000000AA"}
+        if method == "eth_getTransactionReceipt":
+            return {"blockNumber": hex(999),
+                    "effectiveGasPrice": hex(self.BASE + self.TIP),
+                    "gasUsed": hex(400_000), "status": "0x1"}
+        if method == "eth_getBlockByNumber":
+            return {"baseFeePerGas": hex(self.BASE), "timestamp": hex(1_754_300_000)}
+        raise AssertionError(f"неожиданный метод {method}")
+
+
+def test_log_push_tips_writes_jsonl_and_dedupes(monkeypatch, tmp_path):
+    out = tmp_path / "tips.jsonl"
+    monkeypatch.setattr(C, "SPEC_TIP_LOG", str(out))
+    spec._tip_seen.clear()
+    try:
+        spec._log_push_tips(_TipRpc(), [(spec.ADAPTER_A, "HYPE")])
+        rows = [json.loads(ln) for ln in open(out)]
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["tip_gwei"] == pytest.approx(1.5)
+        assert r["base_gwei"] == pytest.approx(0.1)
+        assert r["from"].startswith("0xe08496b4"), "адрес нормализуется в нижний регистр"
+        assert r["st"] == 1 and r["block"] == 999 and r["adapter"] == spec.ADAPTER_A
+        # повторный детект того же tx (второй фид того же пуша) — дедуп, строка одна
+        spec._log_push_tips(_TipRpc(), [(spec.ADAPTER_A, "BTC")])
+        assert len(open(out).read().splitlines()) == 1
+    finally:
+        spec._tip_seen.clear()

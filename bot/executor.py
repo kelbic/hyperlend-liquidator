@@ -1379,7 +1379,11 @@ def _spec_pass(accounts: dict, st: dict, now_ts: float, gas_usd: float) -> int:
     Арм НЕ снимается зондом — окно живёт повторами; победа сама закрывает и окно (позиция
     закрыта -> HF-гейт), и арм (PREARM_TTL/prearm_tick). Ключи зондов в st["sent"] уникальны
     (borrower#pN), так что реактивный дедуп по borrower они не трогают; настоящий реактивный
-    выстрел (recently_fired по borrower) зонды ГЕЙТИТ — двух ликвидаций одной цели не шлём."""
+    выстрел (recently_fired по borrower) зонды ГЕЙТИТ — двух ликвидаций одной цели не шлём.
+
+    Мультитранзит (C.SPEC_QUEUE): один пуш может открыть несколько целей, а зонд — один на
+    блок, значит порядок целей = деньги. За проход стреляет цель с максимальным net, остальные
+    ждут следующего блока (их окна открыты и кормятся планом; кап топ-цели передаёт очередь)."""
     if not (C.SPEC_FIRE and C.RAW_TX and C.CONTRACT):
         return 0
     with _prearm_lock:
@@ -1396,6 +1400,7 @@ def _spec_pass(accounts: dict, st: dict, now_ts: float, gas_usd: float) -> int:
             print(f"  spec window closed {b[:10]}…: {w['probes']} зондов "
                   f"за {now_mono - w['first']:.1f}с")
     n = 0
+    ranked: list[tuple[float, str, dict, float, dict]] = []
     for b, rec in armed:
         acct = accounts.get(b)
         if acct is None or now_mono - rec["ts"] > C.PREARM_TTL:
@@ -1412,13 +1417,21 @@ def _spec_pass(accounts: dict, st: dict, now_ts: float, gas_usd: float) -> int:
             continue
         if recently_fired(st, b, now_ts):
             continue        # реактивный выстрел по цели в полёте/остывает — зонд не дублирует
+        ranked.append((float(rec["ev"].get("net_usd") or 0.0), b, rec, hf, p))
+    # Очередь мультитранзита: net убывает, за проход стреляет топ (C.SPEC_QUEUE) — вторая цель
+    # ждёт следующего блока, её окно уже открыто выше и кормится планом. ОТКАТ SPEC_QUEUE=0:
+    # веер — зонд каждой цели за проход (порядок остаётся net-убывающим).
+    ranked.sort(key=lambda r: (-r[0], r[1]))
+    for _net, b, rec, hf, p in (ranked[:1] if C.SPEC_QUEUE else ranked):
         if not C.DRY_RUN and not check_balance(st, now_ts, force=True):
             print(f"  spec skip {b[:10]}… — недостаточно газа на EOA (см. ⛽-алерт)")
             break
+        w = _spec_windows[b]
         w["probes"] += 1
+        qtag = f" q1/{len(ranked)}" if C.SPEC_QUEUE and len(ranked) > 1 else ""
         print(f"  🎯 probe #{w['probes']} {b[:10]}… HF={hf:.4f} est={p['hf_est']:.4f} "
               f"ждём push {'+'.join(p['feeds'])}@{p['adapter'][:10]}… "
-              f"age={p['age_ms']/1000:.1f}s tip={C.SPEC_TIP_GWEI}")
+              f"age={p['age_ms']/1000:.1f}s tip={C.SPEC_TIP_GWEI}{qtag}")
         fire(rec["t"], rec["ev"], st, now_ts, gas_usd, spec_probe=True)
         n += 1
     return n
