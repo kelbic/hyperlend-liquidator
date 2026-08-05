@@ -366,6 +366,7 @@ def gas_cost_usd(rpc: Rpc) -> float:
         _note_basefee(base)     # кормит кэш _fee_params: путь выстрела без лишнего RPC
     except Exception:
         base = int(0.1 * 1e9)
+    refresh_market_tip(rpc)     # цена места в блоке — туда же, по TTL, вне пути выстрела
     return C.GAS_UNITS_EST * base / 1e18 * C.HYPE_USD
 
 
@@ -672,6 +673,37 @@ def _note_basefee(base_wei: int) -> None:
     _basefee_cache["wei"], _basefee_cache["ts"] = base_wei, time.monotonic()
 
 
+_market_tip_cache: dict = {"gwei": 0.0, "ts": 0.0}
+
+
+def _market_tip_gwei() -> float:
+    """Рыночная цена места в блоке из кэша. ЧИСТОЕ чтение: на пути выстрела RPC недопустим —
+    ровно поэтому же baseFee кормится из цикла, а не читается при отправке."""
+    return _market_tip_cache["gwei"]
+
+
+def refresh_market_tip(rpc: Rpc) -> None:
+    """Обновить цену места = медиана p90 чаевых последних блоков (один eth_feeHistory).
+
+    Медиана, а не максимум: одиночный всплеск (замер 05.08 — 65 gwei в одном блоке из 20 при
+    медиане 0.11) не должен задирать каждую нашу ставку. В каскаде поднимается вся серия, и
+    медиана идёт за ней. Отказ чтения оставляет ПРОШЛЫЙ замер, а не ноль: слепое обнуление
+    отправило бы нас в конец блока ровно в шторм, когда чтения и падают."""
+    if not C.TIP_MARKET:
+        return
+    now = time.monotonic()
+    if now - _market_tip_cache["ts"] < C.TIP_MARKET_TTL:
+        return
+    try:
+        fh = rpc.call("eth_feeHistory", [hex(C.TIP_MARKET_BLOCKS), "latest", [90]])
+        rew = sorted(int(r[0], 16) / 1e9 for r in (fh.get("reward") or []) if r)
+        if rew:
+            _market_tip_cache["gwei"] = rew[len(rew) // 2]
+    except Exception:                       # noqa: BLE001 — цена места не смеет ронять цикл
+        pass
+    _market_tip_cache["ts"] = now
+
+
 def _tip_wei(net_usd: float | None, st: dict | None = None) -> int:
     """Чаевые за место в блоке (04.08: малые блоки упорядочены по tip — см. config.TIP_MODE).
     Платим долю приза, зажатую в [TIP_MIN, TIP_MAX]; перевод $ -> gwei через оценочный gasUsed
@@ -685,7 +717,17 @@ def _tip_wei(net_usd: float | None, st: dict | None = None) -> int:
     budget_usd = max(0.0, net_usd or 0.0) * C.TIP_PRIZE_FRAC
     denom = C.HYPE_USD * C.GAS_UNITS_EST * 1e-9          # $ за 1 gwei чаевых на всю tx
     per_gas_gwei = budget_usd / denom if denom > 0 else 0.0
-    tip_gwei = min(C.TIP_MAX_GWEI, max(C.TIP_MIN_GWEI, per_gas_gwei))
+    if C.TIP_MARKET:
+        # Рынок — драйвер, доля приза — потолок (см. config: замер 05.08 по 21 ликвидации).
+        # Место в блоке стоит столько, сколько платит верх блока, а не сколько мы выиграем.
+        ceiling = max(C.TIP_MIN_GWEI, min(C.TIP_MAX_GWEI, per_gas_gwei))
+        if (net_usd or 0.0) >= C.TIP_BIG_PRIZE_USD:
+            tip_gwei = ceiling          # крупный приз: платим потолок, рынок не спрашиваем
+        else:
+            market = _market_tip_gwei()
+            tip_gwei = min(max(C.TIP_MIN_GWEI, market * C.TIP_MARKET_MULT), ceiling)
+    else:
+        tip_gwei = min(C.TIP_MAX_GWEI, max(C.TIP_MIN_GWEI, per_gas_gwei))
     bal = (st or {}).get("balance_hype")
     base = _basefee_cache["wei"]
     if bal is not None and base is not None and C.GAS_LIMIT > 0:

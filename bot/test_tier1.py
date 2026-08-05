@@ -142,7 +142,13 @@ def test_tip_off_mode_is_priority_gwei(monkeypatch):
 
 
 def test_tip_scales_with_prize(monkeypatch):
+    """Прежняя формула «доля приза как драйвер» — теперь под флагом отката HL_TIP_MARKET=0.
+
+    05.08 драйвером стал рынок (замер: верх блока стоит медиану 2 gwei, победители платили
+    0-5, а доля приза назначала $200-призу 115 gwei). Тест сохранён как приёмка ОТКАТА:
+    выключенный TIP_MARKET обязан вернуть прежнее поведение байт-в-байт."""
     monkeypatch.setattr(C, "TIP_MODE", "auto")
+    monkeypatch.setattr(C, "TIP_MARKET", False)
     monkeypatch.setattr(C, "TIP_MIN_GWEI", 5.0)
     monkeypatch.setattr(C, "TIP_MAX_GWEI", 1000.0)
     monkeypatch.setattr(C, "TIP_PRIZE_FRAC", 0.05)
