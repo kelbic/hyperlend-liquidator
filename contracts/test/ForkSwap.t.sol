@@ -25,7 +25,11 @@ contract ForkSwapTest is Test {
     address constant USDC = 0xb88339CB7199b77E23DB6E890353E22632Ba630f;
 
     function test_realRouterSendsOutputToMsgSender() public {
-        vm.createSelectFork(vm.envString("HYPE_RPC"));
+        // Manual harness: needs a freshly-fetched route (see header). Without env it SKIPS —
+        // a suite that is red by default teaches everyone to ignore red.
+        string memory rpcUrl = vm.envOr("HYPE_RPC", string(""));
+        vm.skip(bytes(rpcUrl).length == 0);
+        vm.createSelectFork(rpcUrl);
         address router = vm.envAddress("SWAP_TARGET");
         bytes memory cd = vm.envBytes("SWAP_CALLDATA");
         uint256 amountIn = vm.envUint("AMOUNT_IN_WEI");

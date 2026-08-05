@@ -69,7 +69,12 @@ contract ForkLiquidationTest is Test {
     }
 
     function setUp() public {
-        vm.createSelectFork(vm.envString("HYPE_RPC"));
+        // Without HYPE_RPC (plain `forge test`) the fork suite SKIPS instead of failing:
+        // a suite that is red by default teaches everyone to ignore red. Live run:
+        //   HYPE_RPC=... forge test --match-path test/ForkLiquidation.t.sol
+        string memory rpcUrl = vm.envOr("HYPE_RPC", string(""));
+        vm.skip(bytes(rpcUrl).length == 0);
+        vm.createSelectFork(rpcUrl);
         whypePrice = IOracleGetter(ORACLE).getAssetPrice(WHYPE);
         assertGt(whypePrice, 0, "no WHYPE price on fork");
         // the on-chain fee the whole model is calibrated to
