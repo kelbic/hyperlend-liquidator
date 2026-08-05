@@ -190,7 +190,12 @@ PREARM = os.environ.get("HL_PREARM", "1") == "1"
 PREARM_HF = float(os.environ.get("HL_PREARM_HF", "1.02"))
 PREARM_TTL = float(os.environ.get("HL_PREARM_TTL", "45"))
 PREARM_REFRESH_SEC = float(os.environ.get("HL_PREARM_REFRESH_SEC", "20"))
-PREARM_MAX = int(os.environ.get("HL_PREARM_MAX", "2"))
+# 05.08: замер квотера LiquidSwap (лестница 2/4/8 параллельных, 0 отказов, медиана
+# 1.48с -> 1.80с) снял прежнее ограничение «API не выдержит». Потолок держал
+# последовательный обход пре-арма — он распараллелен, поэтому глубина арма поднята
+# с 2 до 6: в каскаде тонет не одна цель, а весь ряд сразу.
+PREARM_MAX = int(os.environ.get("HL_PREARM_MAX", "6"))
+PREARM_WORKERS = int(os.environ.get("HL_PREARM_WORKERS", "4"))   # 1 = прежний обход
 PREARM_SHAVE = (97, 100)
 
 # --- SPEC-CONSUMER: предсказание ЧУЖОГО пуша (04.08 — вторая жизнь spec-слоя) --------------

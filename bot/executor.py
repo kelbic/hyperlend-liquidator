@@ -73,6 +73,7 @@ import os
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import urllib.parse
 import urllib.request
@@ -1249,12 +1250,26 @@ def _prearm_quote(rpc: Rpc, book: dict, borrowers: list[str], accounts: dict,
         _, risk = refine(rpc, book, accounts, borrowers, reserves_cfg,
                          min_debt_usd=C.MIN_DEBT_USD, watch_hf=C.PREARM_HF,
                          report_hf=C.PREARM_HF, retries=1)
-        for t in risk:
+        def _one(t: dict):
             # coll==debt больше НЕ фильтруется здесь: контракт v2 пропускает своп, а решение
             # (и видимый отказ при HL_SAME_ASSET=0) принадлежит evaluate/_evaluate_one.
             hyp = dict(t, hf_1e18=int(0.999e18))
             shaved = _resize(hyp, *C.PREARM_SHAVE) or hyp
-            ev = evaluate(shaved, gas_usd)
+            return t, shaved, evaluate(shaved, gas_usd)
+
+        # 05.08: замер квотера (10 последовательных + лестница 2/4/8 параллельных, БЕЗ единого
+        # отказа; медиана 1.48с -> 1.80с на восьмёрке) показал, что потолок держит не API, а
+        # этот цикл: каждая цель проходит лестницу чанков последовательно, и шесть целей
+        # укладываются в 30-40с — дольше и PREARM_REFRESH_SEC, и TTL, то есть в каскаде
+        # арм не успевал бы обновиться. Котируем цели пулом; кэш пишется под тем же локом.
+        # ОТКАТ: HL_PREARM_WORKERS=1 — прежний последовательный обход.
+        if C.PREARM_WORKERS > 1 and len(risk) > 1:
+            with ThreadPoolExecutor(max_workers=min(C.PREARM_WORKERS, len(risk))) as ex:
+                results = list(ex.map(_one, risk))
+        else:
+            results = [_one(t) for t in risk]
+
+        for t, shaved, ev in results:
             if ev and "skip" not in ev and ev.get("profitable"):
                 with _prearm_lock:
                     _prearm[t["borrower"]] = {"t": shaved, "ev": ev, "ts": time.monotonic()}
