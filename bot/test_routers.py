@@ -73,6 +73,7 @@ def test_pt_goes_to_pendle_and_never_asks_liquidswap(monkeypatch):
 
 
 def test_expired_pt_uses_redeem_branch(monkeypatch):
+    monkeypatch.setattr(C, "CONTRACT", "0x" + "22" * 20)   # конфиг мог быть импортирован раньше
     urls = []
     monkeypatch.setattr(R, "_get_json", lambda url, tmo: (
         urls.append(url) or {"tx": {"to": R.PENDLE_ROUTER, "data": "0xbb"},
@@ -83,6 +84,7 @@ def test_expired_pt_uses_redeem_branch(monkeypatch):
 
 
 def test_live_pt_uses_market_swap_branch(monkeypatch):
+    monkeypatch.setattr(C, "CONTRACT", "0x" + "22" * 20)
     urls = []
     monkeypatch.setattr(R, "_get_json", lambda url, tmo: (
         urls.append(url) or {"tx": {"to": R.PENDLE_ROUTER, "data": "0xbb"},
