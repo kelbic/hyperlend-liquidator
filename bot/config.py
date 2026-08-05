@@ -289,3 +289,9 @@ TG_CHAT_ID = os.environ.get("HL_CHAT_ID", "265715923")
 # The whole liquidator fleet posts into ONE chat, so every outgoing alert is prefixed with this
 # short tag — without it an alert cannot be attributed to the bot that sent it.
 BOT_TAG = os.environ.get("HL_BOT_TAG", "hyperlend")
+
+# Мультивенчурная маршрутизация выхода (bot/routers.py). Замер 05.08: LiquidSwap не знает
+# PT-kHYPE (404 на любом размере) и отдаёт по beHYPE константу 1.690 WHYPE на любой вход —
+# то есть отравленную котировку, а не отказ. Pendle закрывает PT (impact 0.06-0.07% даже на
+# $1M), Kyber — универсальный запасной. ОТКАТ: HL_MULTI_ROUTER=0 — только LiquidSwap.
+MULTI_ROUTER = os.environ.get("HL_MULTI_ROUTER", "1") == "1"

@@ -86,7 +86,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from bot import config as C                                    # noqa: E402
-from bot import liqd                                           # noqa: E402
+from bot import liqd
+from bot import routers                                           # noqa: E402
 from bot import shadow                                         # noqa: E402
 from bot import spec                                           # noqa: E402
 from analysis.aave import (                                    # noqa: E402
@@ -359,6 +360,22 @@ def alert_async(text: str) -> None:
     threading.Thread(target=_post, daemon=True).start()
 
 
+
+_read_rpc_cache: dict = {"rpc": None}
+
+
+def _read_rpc():
+    """Ленивый READ-ONLY клиент для редких служебных чтений вне горячего пути.
+
+    Нужен ровно одному потребителю — Pendle-адаптеру, который спрашивает у PT его
+    isExpired() (ветка swap или redeem) и кэширует ответ на 15 минут. Держать ради этого
+    ещё один параметр во всех сигнатурах evaluate дороже, чем один ленивый клиент;
+    analysis.rpc.Rpc read-only по построению, отправить через него ничего нельзя."""
+    if _read_rpc_cache["rpc"] is None:
+        _read_rpc_cache["rpc"] = Rpc(hard_timeout=getattr(C, "RPC_HARD_TIMEOUT", None))
+    return _read_rpc_cache["rpc"]
+
+
 # --------------------------------------------------------------------------- gas
 def gas_cost_usd(rpc: Rpc) -> float:
     try:
@@ -491,10 +508,17 @@ def _evaluate_one(t: dict, gas_usd: float) -> dict | None:
              "amount_out": seized, "price_impact": 0.0}
     else:
         try:
-            q = liqd.quote_for_seized(t["coll_asset"], t["debt_asset"], seized,
-                                      t["coll_dec"], t["debt_dec"])
+            if C.MULTI_ROUTER:
+                # 05.08: LiquidSwap не обслуживает PT-kHYPE (404 на любом размере) и отдаёт
+                # по beHYPE КОНСТАНТУ на любой вход. Спрашиваем площадку, которая умеет:
+                # PT -> Pendle, остальное -> LiquidSwap с запасным Kyber.
+                q = routers.quote_for_seized_multi(_read_rpc(), t["coll_asset"], t["debt_asset"],
+                                                   seized, t["coll_dec"], t["debt_dec"])
+            else:
+                q = liqd.quote_for_seized(t["coll_asset"], t["debt_asset"], seized,
+                                          t["coll_dec"], t["debt_dec"])
         except liqd.NoRouteError:
-            return {"skip": "no LiquidSwap route (illiquid/exotic collateral)"}
+            return {"skip": "no route on any venue (illiquid/exotic collateral)"}
         except Exception as e:
             return {"skip": f"quote error: {e}"}
 

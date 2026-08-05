@@ -37,5 +37,31 @@ class TopicHygiene(unittest.TestCase):
         self.assertEqual(TOPIC_SUPPLY.lower(), CANON["Supply"])
 
 
+
+
+class AddressChecksums(unittest.TestCase):
+    """Все адреса в карте протокола обязаны нести валидную контрольную сумму EIP-55.
+
+    05.08: пять из шестнадцати её не несли, и это была не косметика. HTTP-квотеры
+    ВАЛИДИРУЮТ контрольную сумму: liqd.ag отвечал 400 на beHYPE и PT-19MAR2026, что в
+    preflight читалось как «роута нет вообще». Отказ молчаливый и неотличим от честного
+    отсутствия ликвидности — ровно тот класс, который уже стоил нам ложного нуля по
+    сигнатурам событий. Замок держит его закрытым.
+    """
+
+    def test_all_token_addresses_are_valid_eip55(self):
+        from analysis.keccak import keccak
+        from analysis.protocols import TOKENS
+
+        def eip55(addr: str) -> str:
+            a = addr.lower().replace("0x", "")
+            h = keccak(a.encode()).hex()
+            return "0x" + "".join(c.upper() if c.isalpha() and int(h[i], 16) >= 8 else c
+                                  for i, c in enumerate(a))
+
+        bad = {s: (t["address"], eip55(t["address"])) for s, t in TOKENS.items()
+               if t["address"] != eip55(t["address"])}
+        self.assertEqual(bad, {}, f"битая контрольная сумма: {bad}")
+
 if __name__ == "__main__":
     unittest.main()

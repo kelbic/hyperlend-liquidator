@@ -65,11 +65,11 @@ TOKENS = {
     # 04.08: добраны из полного скана истории пула (4078 ликвидаций) — реестр знал не все
     # активы, и shadow-телеметрия не могла оценить событие в долларах (первые же две живые
     # записи пришли с debt_usd=None по USDHL). Символы/decimals прочитаны on-chain.
-    "USDHL":   {"address": "0xB50A96253aBDF803D85efcDce07Ad8becBc52BD5", "decimals": 6,  "bonus_bps": 10800},
-    "USR":     {"address": "0x0aD339d66bF4AEd5ce31c64Bc37B3244B6394A77", "decimals": 18, "bonus_bps": 10800},
-    "USOL":    {"address": "0x068f321Fa8Fb9f0d135f290Ef6a3e2813e1c8A29", "decimals": 9,  "bonus_bps": 11500},
-    "beHYPE":  {"address": "0xd8FC8f0b03eBA61F64d08b0BeF69d80916E5dda9", "decimals": 18, "bonus_bps": 11000},
-    "PT-kHYPE-19MAR2026": {"address": "0xEa84cA9849D9E76A78b91F221f84E9CA065fC9F5", "decimals": 18, "bonus_bps": 11000},
+    "USDHL":   {"address": "0xb50A96253aBDF803D85efcDce07Ad8becBc52BD5", "decimals": 6,  "bonus_bps": 10800},
+    "USR":     {"address": "0x0aD339d66BF4AeD5ce31c64Bc37B3244b6394A77", "decimals": 18, "bonus_bps": 10800},
+    "USOL":    {"address": "0x068f321Fa8Fb9f0D135f290Ef6a3e2813e1c8A29", "decimals": 9,  "bonus_bps": 11500},
+    "beHYPE":  {"address": "0xd8FC8F0b03eBA61F64D08B0bef69d80916E5DdA9", "decimals": 18, "bonus_bps": 11000},
+    "PT-kHYPE-19MAR2026": {"address": "0xea84ca9849D9e76a78B91F221F84e9Ca065FC9f5", "decimals": 18, "bonus_bps": 11000},
 }
 # Стейблы вне «долларовых» символов: цена ~$1, но в STABLES их класть нельзя без проверки
 # ликвидности выхода — здесь только для оценки размера в телеметрии.
