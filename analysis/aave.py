@@ -40,6 +40,13 @@ SEL_GET_ASSET_PRICE = selector("getAssetPrice(address)")
 SEL_GET_RESERVES_LIST = selector("getReservesList()")
 SEL_GET_ASSET_PRICES = selector("getAssetsPrices(address[])")
 SEL_GET_LIQ_PROTOCOL_FEE = selector("getLiquidationProtocolFee(address)")
+# eMode (Aave v3.2+): у резерва в конфиге НЕТ номера категории (биты 168-175 нулевые — проверено
+# на всех 18 резервах 05.08), принадлежность лежит в битовых масках самой категории, где номер
+# бита = индекс резерва в getReservesList(). Пользовательская категория задаёт СВОЙ бонус
+# ликвидации, и именно он применяется вместо резервного — см. emode_bonus() ниже.
+SEL_GET_USER_EMODE = selector("getUserEMode(address)")
+SEL_GET_EMODE_DATA = selector("getEModeCategoryData(uint8)")
+SEL_GET_EMODE_COLL_BITMAP = selector("getEModeCategoryCollateralBitmap(uint8)")
 
 HF_INFINITY = 2 ** 128  # getUserAccountData returns type(uint256).max when there is no debt
 
@@ -86,6 +93,33 @@ def decode_reserve_config(ret_hex: str) -> dict:
         "usage_as_collateral": bool(w[5]), "borrowing_enabled": bool(w[6]),
         "is_active": bool(w[8]), "is_frozen": bool(w[9]),
     }
+
+
+def emode_bonus(user_emode: int, coll_asset: str, reserve_bonus: int, emodes: dict,
+                reserve_index: dict) -> int:
+    """Бонус ликвидации, который РЕАЛЬНО применит пул к паре (заёмщик, залог).
+
+    05.08, форк-экзамен: модель брала бонус из конфига резерва (kHYPE = 11000) и завышала
+    ожидаемый залог на 4.13%. Пул отдал ровно столько, сколько даёт бонус eMode-категории
+    заёмщика (10500) — предсказание сошлось бит-в-бит. Последствие ошибки не «неточная
+    оценка», а гарантированный реверт: в calldata свопа зашивается amountIn от завышенного
+    залога, и роутер падает на «Insufficient token balance» (селектор SwapFailed 0x81ceff30),
+    сжигая газ и проигрывая гонку. Вся плечевая книга (WHYPE против kHYPE/wstHYPE) сидит
+    именно в eMode, так что без этой поправки крупные цели недостижимы в принципе.
+
+    Категория применяется к залогу ТОЛЬКО если его бит стоит в маске залогов категории;
+    иначе действует обычный резервный бонус. Неизвестная категория (нет в кэше) — тоже
+    резервный бонус: не угадываем, а падаем на консервативную сторону.
+    """
+    if not user_emode:
+        return reserve_bonus
+    cat = (emodes or {}).get(int(user_emode)) or (emodes or {}).get(str(user_emode))
+    if not cat or not cat.get("liquidation_bonus"):
+        return reserve_bonus
+    idx = (reserve_index or {}).get(coll_asset.lower())
+    if idx is None or not (int(cat.get("collateral_bitmap", 0)) >> idx) & 1:
+        return reserve_bonus
+    return int(cat["liquidation_bonus"])
 
 
 def decode_address_array(ret_hex: str) -> list[str]:

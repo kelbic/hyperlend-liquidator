@@ -24,10 +24,12 @@ import os
 import time
 
 from analysis.aave import (
-    HF_INFINITY, SEL_GET_ASSET_PRICE, SEL_GET_LIQ_PROTOCOL_FEE, SEL_GET_RESERVE_CONFIG,
-    SEL_GET_RESERVES_LIST, SEL_GET_USER_ACCOUNT_DATA, SEL_GET_USER_RESERVE_DATA,
+    HF_INFINITY, SEL_GET_ASSET_PRICE, SEL_GET_EMODE_COLL_BITMAP, SEL_GET_EMODE_DATA,
+    SEL_GET_LIQ_PROTOCOL_FEE, SEL_GET_RESERVE_CONFIG,
+    SEL_GET_RESERVES_LIST, SEL_GET_USER_ACCOUNT_DATA, SEL_GET_USER_EMODE,
+    SEL_GET_USER_RESERVE_DATA,
     decode_address_array, decode_reserve_config, decode_user_account_data,
-    decode_user_reserve_data, size_liquidation,
+    decode_user_reserve_data, emode_bonus, size_liquidation,
 )
 from analysis.multicall import multicall
 from analysis.protocols import (
@@ -127,6 +129,54 @@ def sweep_accounts(rpc: Rpc, borrower_list: list[str], retries: int = 4) -> dict
     return accounts
 
 
+def load_emodes(rpc: Rpc, book: dict, max_cat: int = 8) -> tuple[dict, dict]:
+    """({категория: {ltv, lt, liquidation_bonus, collateral_bitmap}}, {резерв: индекс}).
+
+    Кэшируется в книге. Индекс резерва — позиция в getReservesList(): именно она задаёт номер
+    бита в масках категории, поэтому список и маски обязаны читаться вместе (порядок резервов
+    меняется только при листинге нового рынка, и тогда кэш пересобирается целиком).
+    """
+    cached = book.get("emodes")
+    if cached and book.get("reserve_index"):
+        return ({int(k): v for k, v in cached.items()},
+                {k.lower(): v for k, v in book["reserve_index"].items()})
+    reserves = decode_address_array(rpc.eth_call(POOL, SEL_GET_RESERVES_LIST))
+    ridx = {a.lower(): i for i, a in enumerate(reserves)}
+    cats: dict[int, dict] = {}
+    calls = []
+    for c in range(1, max_cat + 1):
+        arg = hex(c)[2:].rjust(64, "0")
+        calls.append((POOL, SEL_GET_EMODE_DATA + arg))
+        calls.append((POOL, SEL_GET_EMODE_COLL_BITMAP + arg))
+    res = multicall(rpc, calls)
+    for i, c in enumerate(range(1, max_cat + 1)):
+        ok_d, ret_d = res[2 * i]
+        ok_b, ret_b = res[2 * i + 1]
+        if not ok_d or len(ret_d) < 2 + 4 * 64:
+            continue
+        w = [int(ret_d[2 + j * 64: 2 + (j + 1) * 64], 16) for j in range(4)]
+        ltv, lt, lb = w[1], w[2], w[3]          # w[0] = ABI-смещение строки-метки
+        if not lb:                              # пустая категория — не заведена
+            continue
+        cats[c] = {"ltv": ltv, "liquidation_threshold": lt, "liquidation_bonus": lb,
+                   "collateral_bitmap": int(ret_b[2:66], 16) if ok_b and len(ret_b) >= 66 else 0}
+    book["emodes"] = {str(k): v for k, v in cats.items()}
+    book["reserve_index"] = ridx
+    return cats, ridx
+
+
+def load_user_emodes(rpc: Rpc, borrowers: list[str], retries: int = 4) -> dict:
+    """{заёмщик: номер eMode-категории}. Один multicall — цена та же, что у любого свипа."""
+    if not borrowers:
+        return {}
+    res = multicall(rpc, [(POOL, SEL_GET_USER_EMODE + b[2:].rjust(64, "0")) for b in borrowers],
+                    retries=retries)
+    out = {}
+    for b, (ok, ret) in zip(borrowers, res):
+        out[b] = int(ret[2:66], 16) if ok and len(ret) >= 66 else 0
+    return out
+
+
 def refine(rpc: Rpc, book: dict, accounts: dict, candidates: list[str],
            reserves_cfg: dict | None = None, min_debt_usd: float = MIN_DEBT_USD,
            watch_hf: float = WATCH_HF, report_hf: float = REPORT_HF, retries: int = 4):
@@ -145,7 +195,18 @@ def refine(rpc: Rpc, book: dict, accounts: dict, candidates: list[str],
             and accounts[b]["health_factor"] < HF_INFINITY]
 
     prices, user_reserves = {}, {}
+    emodes, reserve_index, user_emodes = {}, {}, {}
     if near:
+        # eMode заёмщика меняет бонус ликвидации (см. aave.emode_bonus): без этого модель
+        # завышает ожидаемый залог и своп ревертит. Категории кэшируются в книге, категория
+        # заёмщика читается одним multicall'ом на набор.
+        try:
+            emodes, reserve_index = load_emodes(rpc, book)
+            user_emodes = load_user_emodes(rpc, near, retries=retries)
+        except Exception as e:                                     # noqa: BLE001
+            print(f"  [emode] чтение категорий не удалось ({type(e).__name__}) — "
+                  f"остаёмся на резервных бонусах")
+            emodes, reserve_index, user_emodes = {}, {}, {}
         pres = multicall(rpc, [(ORACLE, SEL_GET_ASSET_PRICE + a[2:].rjust(64, "0"))
                                for a in reserves], retries=retries)
         for a, (ok, ret) in zip(reserves, pres):
@@ -164,7 +225,8 @@ def refine(rpc: Rpc, book: dict, accounts: dict, candidates: list[str],
     targets, risk = [], []
     for b in near:
         acct = accounts[b]
-        row = _build_row(b, acct, user_reserves.get(b, {}), reserves_cfg, prices)
+        row = _build_row(b, acct, user_reserves.get(b, {}), reserves_cfg, prices,
+                         user_emodes.get(b, 0), emodes, reserve_index)
         if row is None:
             continue
         if acct["health_factor"] < int(1e18) and (row["repaid_usd"] >= min_debt_usd or row["debt_to_cover"] > 0):
@@ -208,7 +270,9 @@ def scan(rpc: Rpc | None = None, book: dict | None = None,
             "targets": targets, "risk": risk, "book": book}
 
 
-def _build_row(borrower: str, acct: dict, ureserves: dict, cfg: dict, prices: dict) -> dict | None:
+def _build_row(borrower: str, acct: dict, ureserves: dict, cfg: dict, prices: dict,
+               user_emode: int = 0, emodes: dict | None = None,
+               reserve_index: dict | None = None) -> dict | None:
     """Pick the best (debt, collateral) leg for `borrower` and size the liquidation. The runner-up
     collateral leg (same debt) rides along as row['alt'] — the executor falls back to it when the
     primary collateral has no LiquidSwap route (e.g. exotic Pendle PT)."""
@@ -222,10 +286,13 @@ def _build_row(borrower: str, acct: dict, ureserves: dict, cfg: dict, prices: di
         if debt_wei > 0 and prices.get(a):
             val = debt_wei * prices[a] // (10 ** c["decimals"])
             debts.append((a, debt_wei, val))
-        if (d["aToken_balance"] > 0 and d["usage_as_collateral"] and c["liquidation_bonus"] > 10000
-                and prices.get(a)):
-            val = d["aToken_balance"] * prices[a] // (10 ** c["decimals"])
-            colls.append((a, d["aToken_balance"], val, c["liquidation_bonus"]))
+        if d["aToken_balance"] > 0 and d["usage_as_collateral"] and prices.get(a):
+            # бонус берём ТОТ, который применит пул: eMode заёмщика перекрывает резервный
+            bonus = emode_bonus(user_emode, a, c["liquidation_bonus"], emodes or {},
+                                reserve_index or {})
+            if bonus > 10000:
+                val = d["aToken_balance"] * prices[a] // (10 ** c["decimals"])
+                colls.append((a, d["aToken_balance"], val, bonus))
     if not debts or not colls:
         return None
 
