@@ -20,3 +20,4 @@ contracts/lib/
 # runtime state / logs / data snapshots
 data/*
 !data/.gitkeep
+data/depeg_history.jsonl
