@@ -56,20 +56,64 @@ def _liqd_no_route(coll, debt, seized, cd, dd):
     raise liqd.NoRouteError("no route")
 
 
-def test_pt_goes_to_pendle_and_never_asks_liquidswap(monkeypatch):
-    seen = {"liqd": 0}
+def test_pt_exits_in_two_legs_and_never_asks_liquidswap_for_the_pt(monkeypatch):
+    """PT продаётся Pendle в underlying, и только потом underlying — в долговой актив.
 
+    Одной ногой не выходит: прямой PT->WHYPE у Pendle тянет вложенный своп агрегатора и
+    падает по out of gas (форк 05.08: SwapFailed при 2.5M и при 2.9M, залога хватало).
+    """
     def spy(*a, **k):
-        seen["liqd"] += 1
-        raise AssertionError("PT не должен уходить в LiquidSwap")
+        raise AssertionError("PT не должен уходить в LiquidSwap первой ногой")
 
     monkeypatch.setattr(liqd, "quote_for_seized", spy)
-    monkeypatch.setattr(R, "quote_pendle",
-                        lambda rpc, ti, to, amt, **k: R._norm(amt, 0.0006, R.PENDLE_ROUTER,
-                                                              "0xpendle", amt, "pendle"))
+    seen = {}
+
+    def fake_pendle(rpc, ti, to, amt, **k):
+        seen["aggregator"] = k.get("aggregator")
+        seen["token_out"] = to
+        return R._norm(int(amt * 0.98), 0.0006, R.PENDLE_ROUTER, "0xpendle", amt, "pendle")
+
+    monkeypatch.setattr(R, "quote_pendle", fake_pendle)
+    monkeypatch.setattr(liqd, "quote",
+                        lambda ti, to, amt, dl, dr, **k: {"amount_out": int(amt * 1.01),
+                                                          "price_impact": 0.002,
+                                                          "swap_target": "0xliqd",
+                                                          "swap_calldata": "0xbb",
+                                                          "amount_in_used": amt})
     q = R.quote_for_seized_multi(FakeRpc(), PT, WHYPE, 10 ** 20, 18, 18)
-    assert q["venue"] == "pendle" and q["swap_target"] == R.PENDLE_ROUTER
-    assert seen["liqd"] == 0
+    assert q["venue"] == "pendle+liqd"
+    assert q["swap_target"] == R.PENDLE_ROUTER and q["swap_target2"] == "0xliqd"
+    assert q["mid_asset"].lower() == KHYPE.lower(), "промежуточный актив — underlying PT"
+    assert seen["aggregator"] is False, "первая нога обязана идти БЕЗ агрегатора (газ)"
+    assert seen["token_out"].lower() == KHYPE.lower()
+
+
+def test_two_leg_impact_is_summed_so_the_gate_sees_the_whole_path(monkeypatch):
+    """Порог MAX_IMPACT должен видеть просадку ОБЕИХ ног, иначе путь пролезет по половине."""
+    monkeypatch.setattr(R, "quote_pendle",
+                        lambda rpc, ti, to, amt, **k: R._norm(amt, 0.02, R.PENDLE_ROUTER,
+                                                              "0xa", amt, "pendle"))
+    monkeypatch.setattr(liqd, "quote",
+                        lambda ti, to, amt, dl, dr, **k: {"amount_out": amt, "price_impact": 0.03,
+                                                          "swap_target": "0xliqd",
+                                                          "swap_calldata": "0xbb",
+                                                          "amount_in_used": amt})
+    q = R.quote_for_seized_multi(FakeRpc(), PT, WHYPE, 10 ** 20, 18, 18)
+    assert abs(q["price_impact"] - 0.05) < 1e-9
+
+
+def test_pt_with_debt_equal_to_underlying_stays_single_leg(monkeypatch):
+    """Если долг И ЕСТЬ underlying, второй хоп не нужен — лишняя нога это лишний газ и риск."""
+    monkeypatch.setattr(R, "quote_pendle",
+                        lambda rpc, ti, to, amt, **k: R._norm(amt, 0.001, R.PENDLE_ROUTER,
+                                                              "0xa", amt, "pendle"))
+
+    def boom(*a, **k):
+        raise AssertionError("вторая нога не нужна при долге в underlying")
+
+    monkeypatch.setattr(liqd, "quote", boom)
+    q = R.quote_for_seized_multi(FakeRpc(), PT, KHYPE, 10 ** 20, 18, 18)
+    assert not q.get("swap_target2")
 
 
 def test_expired_pt_uses_redeem_branch(monkeypatch):
@@ -154,3 +198,36 @@ def test_rollback_switch_keeps_only_liquidswap(monkeypatch):
     q = R.quote_for_seized_multi(FakeRpc(), BEHYPE, WHYPE, 10 ** 18, 18, 18)
     assert q["venue"] == "liqd"          # мусор пропущен наверх — его отклонит порог импакта
     assert q["price_impact"] >= C.MAX_IMPACT
+
+
+# --- потолок глубины ---------------------------------------------------------------------
+# Выше обрыва квотер ВРЁТ: на $1.15M kHYPE->WHYPE он вернул impact −0.03% («лучше оракула»),
+# а своп ревертнул в самом пуле (0xd93c0665, форк-экзамен 05.08). Порог импакта такую
+# котировку не ловит по построению — режем по замеру.
+
+def test_size_beyond_measured_depth_is_refused_so_the_ladder_goes_smaller(monkeypatch):
+    monkeypatch.setattr(liqd, "quote_for_seized",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("не должны спрашивать")))
+    with pytest.raises(liqd.NoRouteError):
+        R.quote_for_seized_multi(FakeRpc(), KHYPE, WHYPE, 10 ** 22, 18, 18,
+                                 usd_hint=1_150_000.0)
+
+
+def test_size_within_depth_passes_through(monkeypatch):
+    monkeypatch.setattr(liqd, "quote_for_seized", _liqd_ok(10 ** 18))
+    q = R.quote_for_seized_multi(FakeRpc(), KHYPE, WHYPE, 10 ** 20, 18, 18, usd_hint=400_000.0)
+    assert q["venue"] == "liqd"
+
+
+def test_two_leg_depth_is_checked_on_the_underlying_not_the_pt(monkeypatch):
+    """У PT узкое место — вторая нога: продаётся kHYPE, а глубины PT у Pendle с запасом."""
+    monkeypatch.setattr(R, "quote_pendle",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("до Pendle не дойдёт")))
+    with pytest.raises(liqd.NoRouteError):
+        R.quote_for_seized_multi(FakeRpc(), PT, WHYPE, 10 ** 22, 18, 18, usd_hint=1_150_000.0)
+
+
+def test_no_hint_means_no_cap(monkeypatch):
+    """Без подсказки о размере режем только по квотеру — отсутствие цены не смеет ломать путь."""
+    monkeypatch.setattr(liqd, "quote_for_seized", _liqd_ok(10 ** 18))
+    assert R.quote_for_seized_multi(FakeRpc(), KHYPE, WHYPE, 10 ** 24, 18, 18)["venue"] == "liqd"

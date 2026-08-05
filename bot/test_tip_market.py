@@ -91,3 +91,35 @@ def test_refresh_keeps_last_value_when_rpc_fails():
     E._market_tip_cache["ts"] = 0.0          # просрочить кэш, чтобы рефреш реально пошёл
     E.refresh_market_tip(Boom())
     assert E._market_tip_cache["gwei"] == 7.5
+
+
+# --- энкодер двуногого вызова -------------------------------------------------------------
+# Проверяем ровно то, что уедет в сеть: селектор и порядок аргументов. Ошибка здесь не видна
+# ни в одном логе — она вскроется ревертом в бою, на реальной цели.
+
+def _target():
+    return {"coll_asset": "0x50fC4EDC6346F36993Bb30Fe60E932504Ed17391",
+            "debt_asset": "0x5555555555555555555555555555555555555555",
+            "borrower": "0xa625e8ae74d928b9284ef9552058ddae9f5f8972"}
+
+
+def test_encoder_picks_two_leg_selector_when_quote_has_second_leg():
+    ev = {"swap_calldata": "0xaabb", "swap_target": "0x8888888888897 58F76e7103c6CbF23ABbF58F946".replace(" ", ""),
+          "swap_calldata2": "0xccdd", "swap_target2": "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5",
+          "mid_asset": "0xfD739d4e423301CE9385c1fb8850539D657C296D",
+          "debt_to_cover": 10 ** 18, "min_profit_wei": 7}
+    data = E._encode_liquidate(_target(), ev)
+    assert data.startswith(E.TWO_LEG_SELECTOR)
+    assert E.TWO_LEG_SELECTOR != E.LIQUIDATE_SELECTOR
+    # обе calldata обязаны присутствовать целиком
+    assert "aabb" in data and "ccdd" in data
+    # промежуточный актив и второй роутер — в аргументах
+    assert "fd739d4e423301ce9385c1fb8850539d657c296d" in data.lower()
+    assert "6131b5fae19ea4f9d964eac0408e4408b66337b5" in data.lower()
+
+
+def test_encoder_stays_single_leg_without_second_leg():
+    ev = {"swap_calldata": "0xaabb", "swap_target": "0x744489ee3D540777A66f2cf297479745e0852f7a",
+          "debt_to_cover": 10 ** 18, "min_profit_wei": 7}
+    data = E._encode_liquidate(_target(), ev)
+    assert data.startswith(E.LIQUIDATE_SELECTOR)

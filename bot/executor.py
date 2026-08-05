@@ -111,6 +111,12 @@ LIQUIDATE_SELECTOR = "0x" + keccak(text=LIQUIDATE_SIG)[:4].hex()   # 0x3c78a656
 PUSH_SIG = ("liquidateWithPush(address,bytes,address,address,address,"
             "uint256,bool,address,bytes,uint256)")
 PUSH_TYPES = PUSH_SIG[PUSH_SIG.index("(") + 1:-1].split(",")
+# Две ноги выхода (контракт v3, 05.08): залог -> midAsset -> долг. Нужна там, где прямого
+# маршрута нет или он не влезает в 3M газа малого блока — случай PT-kHYPE.
+TWO_LEG_SIG = ("liquidateTwoLeg(address,address,address,uint256,bool,address,bytes,"
+               "address,address,bytes,uint256)")
+TWO_LEG_TYPES = TWO_LEG_SIG[TWO_LEG_SIG.index("(") + 1:-1].split(",")
+TWO_LEG_SELECTOR = "0x" + keccak(text=TWO_LEG_SIG)[:4].hex()
 PUSH_SELECTOR = "0x" + keccak(text=PUSH_SIG)[:4].hex()
 
 
@@ -512,8 +518,14 @@ def _evaluate_one(t: dict, gas_usd: float) -> dict | None:
                 # 05.08: LiquidSwap не обслуживает PT-kHYPE (404 на любом размере) и отдаёт
                 # по beHYPE КОНСТАНТУ на любой вход. Спрашиваем площадку, которая умеет:
                 # PT -> Pendle, остальное -> LiquidSwap с запасным Kyber.
+                # usd_hint — размер ПРОДАВАЕМОГО в этом чанке, по цене оракула: по нему
+                # режется размер выше замеренной глубины (котировка там врёт, см. routers)
+                # подсказка НЕОБЯЗАТЕЛЬНА: без цены залога режем только по квотеру, а не падаем
+                cp = t.get("coll_price")
+                seized_usd = (seized / 10 ** t["coll_dec"] * cp / ORACLE_BASE_UNIT) if cp else None
                 q = routers.quote_for_seized_multi(_read_rpc(), t["coll_asset"], t["debt_asset"],
-                                                   seized, t["coll_dec"], t["debt_dec"])
+                                                   seized, t["coll_dec"], t["debt_dec"],
+                                                   usd_hint=seized_usd)
             else:
                 q = liqd.quote_for_seized(t["coll_asset"], t["debt_asset"], seized,
                                           t["coll_dec"], t["debt_dec"])
@@ -539,6 +551,10 @@ def _evaluate_one(t: dict, gas_usd: float) -> dict | None:
     ok = (q["price_impact"] <= C.MAX_IMPACT) and (net_usd >= C.MIN_PROFIT_USD)
     return {
         "swap_target": q["swap_target"], "swap_calldata": q["swap_calldata"],
+        # вторая нога (PT-выход): пробрасывается КАК ЕСТЬ — решение о её наличии принимает
+        # котировка, энкодер лишь исполняет. Пустые поля = прежний одноногий вызов.
+        "mid_asset": q.get("mid_asset"), "swap_target2": q.get("swap_target2"),
+        "swap_calldata2": q.get("swap_calldata2"), "venue": q.get("venue"),
         "proceeds": proceeds, "owed": owed, "net_wei": net_wei, "net_usd": net_usd,
         "impact": q["price_impact"], "min_profit_wei": min_profit_wei,
         "debt_to_cover": debt_to_cover, "seized": seized, "profitable": ok,
@@ -791,6 +807,26 @@ def _encode_liquidate(t: dict, ev: dict) -> str:
     so this both normalizes caller input and keeps the encode from silently depending on case."""
     cd = ev["swap_calldata"] or "0x"
     raw = cd[2:] if cd[:2].lower() == "0x" else cd
+    if ev.get("swap_target2"):
+        # Двуногий выход: тот же порядок аргументов, плюс промежуточный актив и вторая нога.
+        # Ветку выбирает КОТИРОВКА, а не флаг конфига: если площадка вернула две ноги, значит
+        # одной там не выходит, и молча отбросить вторую означало бы гарантированный реверт.
+        cd2 = ev["swap_calldata2"] or "0x"
+        raw2 = cd2[2:] if cd2[:2].lower() == "0x" else cd2
+        values2 = [
+            to_checksum_address(t["coll_asset"]),
+            to_checksum_address(t["debt_asset"]),
+            to_checksum_address(t["borrower"]),
+            int(ev["debt_to_cover"]),
+            bool(C.USE_FLASHLOAN),
+            to_checksum_address(ev["swap_target"]),
+            bytes.fromhex(raw),
+            to_checksum_address(ev["mid_asset"]),
+            to_checksum_address(ev["swap_target2"]),
+            bytes.fromhex(raw2),
+            int(ev["min_profit_wei"]),
+        ]
+        return TWO_LEG_SELECTOR + abi_encode(TWO_LEG_TYPES, values2).hex()
     values = [
         to_checksum_address(t["coll_asset"]),
         to_checksum_address(t["debt_asset"]),

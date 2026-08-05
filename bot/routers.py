@@ -29,6 +29,7 @@ import urllib.parse
 import urllib.request
 from decimal import Decimal
 
+from analysis.protocols import ADDR_TO_SYMBOL
 from analysis.rpc import _run_with_deadline
 from bot import config as C
 from bot.liqd import LiqdError, NoRouteError, SWAP_INPUT_HAIRCUT
@@ -49,13 +50,45 @@ PENDLE_PT = {
         "sym": "PT-kHYPE-24SEP2026",
         "market": "0xb48b0c95b2ddc464484305b7363fad5bd5b7a683",
         "yt": None,
+        "underlying": "0xfD739d4e423301CE9385c1fb8850539D657C296D",   # kHYPE
     },
     "0xea84ca9849d9e76a78b91f221f84e9ca065fc9f5": {
         "sym": "PT-kHYPE-19MAR2026",
         "market": None,
         "yt": "0x8e8df024cf6d3e916be0821ff3177db6981fcad2",
+        "underlying": "0xfD739d4e423301CE9385c1fb8850539D657C296D",
     },
 }
+
+# Вход второй ноги берётся с запасом от того, что обещала первая: роутер тянет ровно
+# зашитый amountIn, и если первая нога отдаст чуть меньше обещанного, вторая упадёт.
+LEG2_HAIRCUT = float(os.environ.get("HL_LEG2_HAIRCUT", "0.01"))
+
+# ЗАМЕРЕННАЯ глубина выхода, $ на один выстрел (preflight 05.08 + форк-экзамен).
+# Зачем потолок, если есть порог импакта: выше обрыва КОТИРОВКА ВРЁТ. На $1.15M kHYPE->WHYPE
+# квотер вернул impact −0.03% (то есть «лучше оракула»), а своп в бою ревертнул в самом пуле
+# (custom error 0xd93c0665) — форк-экзамен 05.08. Порог импакта такую котировку не ловит по
+# построению, поэтому размер режется по факту замера, а лестница чанков сама спускается ниже.
+# Ключ — символ актива, который ПРОДАЁТ последняя нога.
+EXIT_CAP_USD = {
+    "kHYPE": float(os.environ.get("HL_CAP_KHYPE", "600000")),    # чисто до $600k, обрыв на $700k
+    "wstHYPE": float(os.environ.get("HL_CAP_WSTHYPE", "65000")),  # чисто до $65k, 9.9% на $75k
+    "beHYPE": float(os.environ.get("HL_CAP_BEHYPE", "55000")),    # обрыв ~$59k, 92% глубины — один маркет-мейкер
+}
+
+
+class SizeBeyondDepth(NoRouteError):
+    """Размер выше замеренной глубины: лестница чанков обязана спуститься, а не верить квотеру."""
+
+
+def _cap_for(symbol: str | None) -> float | None:
+    return EXIT_CAP_USD.get(symbol or "")
+
+
+def check_depth(sell_symbol: str | None, usd: float) -> None:
+    cap = _cap_for(sell_symbol)
+    if cap and usd > cap:
+        raise SizeBeyondDepth(f"{sell_symbol}: ${usd:,.0f} выше замеренной глубины ${cap:,.0f}")
 
 # Удобный алиас для тестов ветки redeem (истёкшая серия).
 PT_EXPIRED_SAMPLE = "0xea84ca9849D9e76a78B91F221F84e9Ca065FC9f5"
@@ -106,8 +139,13 @@ def _norm(amount_out: int, impact: float, to: str, data: str, amount_in: int, ve
 
 
 def quote_pendle(rpc, token_in: str, token_out: str, amount_in_wei: int,
-                 receiver: str | None = None, timeout: float | None = None) -> dict:
-    """PT -> token_out через Pendle. До maturity — swap по рынку, после — redeem."""
+                 receiver: str | None = None, timeout: float | None = None,
+                 aggregator: bool = True) -> dict:
+    """PT -> token_out через Pendle. До maturity — swap по рынку, после — redeem.
+
+    aggregator=False просит МАРШРУТ БЕЗ внешнего свопа: он существует только для выхода в
+    сам underlying (kHYPE), зато лёгкий (2085 байт против 4421) и, главное, влезает в газ.
+    Прямой PT->WHYPE с агрегатором на форке падал по out of gas во вложенном вызове."""
     key = token_in.lower()
     meta = PENDLE_PT.get(key)
     if not meta:
@@ -116,7 +154,8 @@ def quote_pendle(rpc, token_in: str, token_out: str, amount_in_wei: int,
     if not receiver:
         raise NoRouteError("Pendle: получатель не задан (HL_CONTRACT пуст)")
     tmo = timeout or QUOTE_TIMEOUT
-    common = {"receiver": receiver, "slippage": "0.01", "enableAggregator": "true",
+    common = {"receiver": receiver, "slippage": "0.01",
+              "enableAggregator": "true" if aggregator else "false",
               "tokenOut": token_out, "amountIn": str(int(amount_in_wei))}
     if pt_expired(rpc, token_in):
         if not meta["yt"]:
@@ -220,9 +259,53 @@ def quote_best(rpc, token_in: str, token_out: str, amount_in_wei: int,
     return best
 
 
+def quote_pt_two_leg(rpc, pt_token: str, debt_token: str, seized_wei: int,
+                     coll_dec: int, debt_dec: int, haircut: float,
+                     usd_hint: float | None = None) -> dict:
+    """Выход из PT в ДВЕ ноги: PT -> underlying (Pendle, без агрегатора) -> долг (LiquidSwap).
+
+    Одной ногой не выходит: прямой маршрут PT->WHYPE у Pendle тянет вложенный своп агрегатора
+    и падает по out of gas — форк 05.08 дал SwapFailed и при 2.5M, и при 2.9M, при этом залога
+    хватало (проверено запасом haircut 6%), а малый блок HyperEVM даёт всего 3M. Лёгкая ветка
+    PT->underlying в бюджет влезает: замер двух ног целиком — 1,384,844 газа (46% лимита),
+    долг заёмщика на форке уменьшился на $464,727.
+
+    Если долг И ЕСТЬ underlying, вторая нога не нужна — возвращаем обычную одноногую котировку.
+    Узкое место по размеру теперь ВТОРАЯ нога (kHYPE->WHYPE держит до ~$600k), и лестница
+    чанков находит проходной размер сама: на f=0.35 impact второй ноги был 47%, на f=0.06 —
+    0.009%.
+    """
+    meta = PENDLE_PT[pt_token.lower()]
+    under = meta["underlying"]
+    amount_in = int(seized_wei * (1.0 - haircut))
+    # у двуногого выхода узкое место — ВТОРАЯ нога: продаётся underlying, а не PT
+    check_depth(ADDR_TO_SYMBOL.get(under.lower()), usd_hint or 0.0)
+    if under.lower() == debt_token.lower():
+        return quote_pendle(rpc, pt_token, debt_token, amount_in, aggregator=False)
+
+    leg1 = quote_pendle(rpc, pt_token, under, amount_in, aggregator=False)
+    mid_in = int(leg1["amount_out"] * (1.0 - LEG2_HAIRCUT))
+    leg2 = liqd.quote(under, debt_token, mid_in, 18, debt_dec)
+    return {
+        "ok": True,
+        "amount_out": leg2["amount_out"],
+        # импакт складываем: гейт MAX_IMPACT должен видеть ПОЛНУЮ просадку пути, а не одной ноги
+        "price_impact": (leg1.get("price_impact") or 0.0) + (leg2.get("price_impact") or 0.0),
+        "swap_target": leg1["swap_target"],
+        "swap_calldata": leg1["swap_calldata"],
+        "mid_asset": under,
+        "swap_target2": leg2["swap_target"],
+        "swap_calldata2": leg2["swap_calldata"],
+        "amount_in_used": amount_in,
+        "venue": "pendle+liqd",
+        "raw": None,
+    }
+
+
 def quote_for_seized_multi(rpc, coll_token: str, debt_token: str, seized_wei: int,
                            coll_decimals: int, debt_decimals: int,
-                           haircut: float = SWAP_INPUT_HAIRCUT) -> dict:
+                           haircut: float = SWAP_INPUT_HAIRCUT,
+                           usd_hint: float | None = None) -> dict:
     """Котировка выхода по всем площадкам, в формате liqd.quote_for_seized.
 
     ВАЖНО про шов: обычный путь идёт РОВНО через liqd.quote_for_seized — то есть ту же
@@ -232,9 +315,12 @@ def quote_for_seized_multi(rpc, coll_token: str, debt_token: str, seized_wei: in
     вход — замер beHYPE 05.08), PT сразу уходит в Pendle.
     """
     if ROUTERS_ENABLED and is_pt(coll_token):
-        q = quote_pendle(rpc, coll_token, debt_token, int(seized_wei * (1.0 - haircut)))
+        q = quote_pt_two_leg(rpc, coll_token, debt_token, seized_wei,
+                             coll_decimals, debt_decimals, haircut, usd_hint)
         q["haircut"] = haircut
         return q
+
+    check_depth(ADDR_TO_SYMBOL.get(coll_token.lower()), usd_hint or 0.0)
 
     first_err: Exception | None = None
     best: dict | None = None

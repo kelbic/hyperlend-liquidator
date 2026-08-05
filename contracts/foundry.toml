@@ -7,6 +7,11 @@ libs = ["lib"]
 solc = "0.8.23"
 optimizer = true
 optimizer_runs = 200
+# 05.08: вторая нога свопа довела liquidateTwoLeg до stack-too-deep на legacy-пайплайне.
+# Альтернативой было прятать аргументы в calldata-структуру, но тогда боту пришлось бы
+# кодировать кортеж с двумя динамическими bytes вручную — лишний источник ошибок на пути
+# выстрела. IR-пайплайн решает это на стороне компилятора и попутно оптимизирует лучше.
+via_ir = true
 fs_permissions = [{ access = "read", path = "./" }]
 
 # HyperEVM mainnet fork target for tests. chainId 999; standard EVM — HyperLend is an Aave-v3.6

@@ -58,11 +58,27 @@ contract HyperLendLiquidator {
     uint256 private _locked = 1; // 1 = unlocked, 2 = locked (nonzero init saves gas)
 
     /// @dev Context handed to the flash-loan callback via `params`.
+    /// Вторая нога (midAsset/swapTarget2/swapCallData2) появилась 05.08 и по умолчанию пуста —
+    /// путь с одним свопом байт-в-байт прежний. Зачем она: у самой дорогой позиции книги
+    /// ($7.7M долга) залог целиком в PT-kHYPE, и прямой маршрут PT->WHYPE у Pendle тянет за
+    /// собой вложенный своп агрегатора, который не влезает в 3M газа малого блока HyperEVM
+    /// (форк-экзамен: out of gas во вложенном вызове даже при 2.9M, при этом ни залога, ни
+    /// лимита не хватало — проверено запасом haircut 6%). Лёгкая ветка PT->kHYPE в бюджет
+    /// влезает, но даёт не тот актив: долг номинирован в WHYPE. Отсюда две ноги.
+    /// @dev Ноги выхода одним значением: иначе _liquidate уходит в stack-too-deep, а дробить
+    /// её ради компилятора значило бы размазать один смысловой шаг по нескольким функциям.
+    struct Legs {
+        address swapTarget;
+        bytes swapCallData;
+        address midAsset;        // что окажется на руках после первой ноги (0 = одна нога)
+        address swapTarget2;
+        bytes swapCallData2;
+    }
+
     struct FlashCtx {
         address collateralAsset;
         address user;
-        address swapTarget;
-        bytes swapCallData;
+        Legs legs;
     }
 
     error NotOwner();
@@ -120,7 +136,34 @@ contract HyperLendLiquidator {
         bytes calldata swapCallData,
         uint256 minProfit
     ) external onlyOwner nonReentrant returns (uint256 profit) {
-        profit = _liquidate(collateralAsset, debtAsset, user, debtToCover, useFlashloan, swapTarget, swapCallData, minProfit);
+        profit = _liquidate(
+            collateralAsset, debtAsset, user, debtToCover, useFlashloan,
+            Legs(swapTarget, swapCallData, address(0), address(0), ""), minProfit
+        );
+    }
+
+    /// @notice liquidate() с ДВУМЯ последовательными свопами: залог -> midAsset -> долг.
+    /// Нужна там, где прямого маршрута залог->долг нет или он не влезает в газ малого блока
+    /// (случай PT-kHYPE, см. комментарий к FlashCtx). Вторая нога включается только при
+    /// swapTarget2 != 0; экономику по-прежнему стерегут CannotRepay и ProfitTooLow, то есть
+    /// лишний хоп не может превратить убыток в «успех».
+    function liquidateTwoLeg(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool useFlashloan,
+        address swapTarget,
+        bytes calldata swapCallData,
+        address midAsset,
+        address swapTarget2,
+        bytes calldata swapCallData2,
+        uint256 minProfit
+    ) external onlyOwner nonReentrant returns (uint256 profit) {
+        profit = _liquidate(
+            collateralAsset, debtAsset, user, debtToCover, useFlashloan,
+            Legs(swapTarget, swapCallData, midAsset, swapTarget2, swapCallData2), minProfit
+        );
     }
 
     /// @notice Same as liquidate(), preceded by an atomic oracle push: `oracleTarget` is called
@@ -151,7 +194,10 @@ contract HyperLendLiquidator {
             (bool pushed,) = oracleTarget.call(oracleCalldata);
             pushed; // deliberate: see @dev — a rejected push must not block the liquidation
         }
-        profit = _liquidate(collateralAsset, debtAsset, user, debtToCover, useFlashloan, swapTarget, swapCallData, minProfit);
+        profit = _liquidate(
+            collateralAsset, debtAsset, user, debtToCover, useFlashloan,
+            Legs(swapTarget, swapCallData, address(0), address(0), ""), minProfit
+        );
     }
 
     function _liquidate(
@@ -160,20 +206,18 @@ contract HyperLendLiquidator {
         address user,
         uint256 debtToCover,
         bool useFlashloan,
-        address swapTarget,
-        bytes calldata swapCallData,
+        Legs memory legs,
         uint256 minProfit
     ) internal returns (uint256 profit) {
         uint256 balBefore = IERC20(debtAsset).balanceOf(address(this));
 
         if (useFlashloan) {
-            bytes memory params = abi.encode(
-                FlashCtx({collateralAsset: collateralAsset, user: user, swapTarget: swapTarget, swapCallData: swapCallData})
-            );
+            bytes memory params =
+                abi.encode(FlashCtx({collateralAsset: collateralAsset, user: user, legs: legs}));
             // Pool sends debtToCover here, calls executeOperation, then pulls debtToCover+premium.
             IPool(POOL).flashLoanSimple(address(this), debtAsset, debtToCover, params, 0);
         } else {
-            _liquidateAndSwap(collateralAsset, debtAsset, user, debtToCover, swapTarget, swapCallData);
+            _liquidateAndSwap(collateralAsset, debtAsset, user, debtToCover, legs);
         }
 
         uint256 balAfter = IERC20(debtAsset).balanceOf(address(this));
@@ -196,7 +240,7 @@ contract HyperLendLiquidator {
         if (initiator != address(this)) revert BadInitiator();
 
         FlashCtx memory c = abi.decode(params, (FlashCtx));
-        _liquidateAndSwap(c.collateralAsset, asset, c.user, amount, c.swapTarget, c.swapCallData);
+        _liquidateAndSwap(c.collateralAsset, asset, c.user, amount, c.legs);
 
         uint256 owed = amount + premium;
         uint256 have = IERC20(asset).balanceOf(address(this));
@@ -214,8 +258,7 @@ contract HyperLendLiquidator {
         address debtAsset,
         address user,
         uint256 debtToCover,
-        address swapTarget,
-        bytes memory swapCallData
+        Legs memory legs
     ) internal {
         // approve the Pool to pull the debt repayment (it pulls the ACTUAL amount, <= debtToCover)
         _forceApprove(debtAsset, POOL, debtToCover);
@@ -235,10 +278,23 @@ contract HyperLendLiquidator {
 
         // swap seized collateral -> debt asset. The Router pulls collateral via transferFrom; the
         // bot bakes an amountIn <= collBal (drift haircut) so this never over-pulls.
-        _forceApprove(collateralAsset, swapTarget, collBal);
-        (bool ok,) = swapTarget.call(swapCallData);
+        _forceApprove(collateralAsset, legs.swapTarget, collBal);
+        (bool ok,) = legs.swapTarget.call(legs.swapCallData);
         if (!ok) revert SwapFailed();
-        _forceApprove(collateralAsset, swapTarget, 0); // drop dangling allowance
+        _forceApprove(collateralAsset, legs.swapTarget, 0); // drop dangling allowance
+
+        // ВТОРАЯ НОГА: midAsset -> debtAsset. Включается только явным swapTarget2, поэтому
+        // путь с одним свопом остаётся прежним. Баланс читается ПОСЛЕ первой ноги — сколько
+        // реально пришло, столько и продаём; нулевой остаток означает, что первая нога не
+        // отдала актив, и это отказ, а не повод молча пропустить хоп.
+        if (legs.swapTarget2 != address(0)) {
+            uint256 midBal = IERC20(legs.midAsset).balanceOf(address(this));
+            if (midBal == 0) revert NothingSeized();
+            _forceApprove(legs.midAsset, legs.swapTarget2, midBal);
+            (bool ok2,) = legs.swapTarget2.call(legs.swapCallData2);
+            if (!ok2) revert SwapFailed();
+            _forceApprove(legs.midAsset, legs.swapTarget2, 0);
+        }
     }
 
     // --------------------------------------------------------------------- recovery

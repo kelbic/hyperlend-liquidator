@@ -283,3 +283,107 @@ contract HyperLendLiquidatorTest is Test {
         );
     }
 }
+
+/// @notice Две ноги выхода: залог -> промежуточный актив -> долг.
+///
+/// Зачем эта ветка вообще есть. Самая дорогая позиция книги ($7.7M долга) держит залог целиком
+/// в PT-kHYPE, а прямой маршрут PT->WHYPE у Pendle тянет вложенный своп агрегатора и не влезает
+/// в 3M газа малого блока HyperEVM (форк-экзамен 05.08: out of gas во вложенном вызове даже при
+/// 2.9M, и это не нехватка залога — проверено запасом haircut 6%). Лёгкая ветка PT->kHYPE в
+/// бюджет влезает, но даёт не тот актив. Отсюда второй хоп.
+contract TwoLegTest is Test {
+    MockERC20 debt;
+    MockERC20 coll;
+    MockERC20 mid;
+    MockPool pool;
+    MockSwap swapr;
+    HyperLendLiquidator liq;
+
+    address user = address(0xB0B);
+
+    function setUp() public {
+        debt = new MockERC20("WHYPE");
+        coll = new MockERC20("PT-kHYPE");
+        mid = new MockERC20("kHYPE");
+        pool = new MockPool(debt, coll, 11);
+        swapr = new MockSwap();
+        liq = new HyperLendLiquidator(address(pool));
+        debt.mint(address(pool), 1_000_000e18);
+    }
+
+    function _leg(MockERC20 tin, MockERC20 tout, uint256 amtIn, uint256 amtOut)
+        internal
+        view
+        returns (bytes memory)
+    {
+        return abi.encodeWithSelector(
+            MockSwap.exchange.selector, address(tin), address(tout), amtIn, amtOut
+        );
+    }
+
+    function test_twoLegSwapReachesDebtAssetAndSweeps() public {
+        uint256 cover = 1_000e18;
+        uint256 seized = cover * 11;                   // мок отдаёт seizePerDebt=11 за единицу долга
+        uint256 midOut = 1_090e18;                     // PT -> kHYPE
+        uint256 debtOut = 1_085e18;                    // kHYPE -> WHYPE (покрывает cover+премию)
+
+        uint256 before = debt.balanceOf(address(this));
+        uint256 profit = liq.liquidateTwoLeg(
+            address(coll), address(debt), user, cover, true,
+            address(swapr), _leg(coll, mid, seized, midOut),
+            address(mid), address(swapr), _leg(mid, debt, midOut, debtOut),
+            1
+        );
+        assertGt(profit, 0, "two legs must land proceeds in the debt asset");
+        assertEq(debt.balanceOf(address(this)) - before, profit, "proceeds swept to owner");
+        assertEq(coll.balanceOf(address(liq)), 0, "no collateral stuck");
+        assertEq(mid.balanceOf(address(liq)), 0, "no mid asset stuck");
+    }
+
+    function test_secondLegFailureRevertsWholeTx() public {
+        uint256 cover = 1_000e18;
+        uint256 seized = cover * 11;
+        // вторая нога просит больше, чем пришло с первой -> transferFrom не пройдёт
+        vm.expectRevert();
+        liq.liquidateTwoLeg(
+            address(coll), address(debt), user, cover, true,
+            address(swapr), _leg(coll, mid, seized, 1_090e18),
+            address(mid), address(swapr), _leg(mid, debt, 9_999e18, 1_085e18),
+            1
+        );
+    }
+
+    function test_emptySecondLegBehavesExactlyLikeSingleSwap() public {
+        uint256 cover = 1_000e18;
+        uint256 seized = cover * 11;
+        uint256 profit = liq.liquidateTwoLeg(
+            address(coll), address(debt), user, cover, true,
+            address(swapr), _leg(coll, debt, seized, 1_085e18),
+            address(0), address(0), "",
+            1
+        );
+        assertGt(profit, 0, "empty second leg == legacy single-swap path");
+    }
+
+    function test_minProfitStillGuardsTheTwoLegPath() public {
+        uint256 cover = 1_000e18;
+        uint256 seized = cover * 11;
+        // выход в убыток: гейт обязан сработать так же, как на одной ноге
+        vm.expectRevert();
+        liq.liquidateTwoLeg(
+            address(coll), address(debt), user, cover, true,
+            address(swapr), _leg(coll, mid, seized, 1_090e18),
+            address(mid), address(swapr), _leg(mid, debt, 1_090e18, 1_085e18),
+            100e18
+        );
+    }
+
+    function test_twoLegOnlyOwner() public {
+        vm.prank(address(0xDEAD));
+        vm.expectRevert(HyperLendLiquidator.NotOwner.selector);
+        liq.liquidateTwoLeg(
+            address(coll), address(debt), user, 1e18, true,
+            address(swapr), "", address(mid), address(swapr), "", 0
+        );
+    }
+}
