@@ -16,6 +16,14 @@
 просадка от базы съедает заметную долю запаса ближайшего кита — будит АГЕНТА (не человека:
 он тут ничего не подписывает — канон [[alerts-only-where-human-acts]]).
 
+Повторная побудка — только по ЭСКАЛАЦИИ. Отношение ходит шумовой полосой ~0.8% с периодом
+в часы (07.08: два подъёма агента за ночь на ОДНОЙ картине, второй — на менее тяжёлой),
+поэтому «условие снова истинно» ≠ «есть новая работа». Состояние последней тревоги живёт в
+data/depeg_alert_state.json и НЕ сбрасывается на просветах: просвет — верхний зуб той же
+пилы, сброс по нему вернул бы побудку на каждом нижнем. Будим снова, если съедено выросло
+на ступень, сменился ближайший кит, или прошло REARM_H часов (пока эпизод длится, это же
+даёт суточное напоминание — у подавления есть срок годности).
+
 Только чтение: оракул + пул. Ни подписи, ни отправки.
 """
 from __future__ import annotations
@@ -34,6 +42,7 @@ from analysis.rpc import Rpc
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 HIST_PATH = os.path.join(DATA_DIR, "depeg_history.jsonl")
+ALERT_STATE_PATH = os.path.join(DATA_DIR, "depeg_alert_state.json")
 
 # Ряд, чьё отношение к WHYPE решает судьбу плечевой книги.
 LST = ["kHYPE", "wstHYPE", "beHYPE", "PT-kHYPE-24SEP2026", "PT-kHYPE-19MAR2026"]
@@ -43,6 +52,8 @@ WINDOW_H = float(os.environ.get("HL_DEPEG_WINDOW_H", "168"))     # окно ба
 DRAWDOWN_ALERT = float(os.environ.get("HL_DEPEG_DRAWDOWN", "0.015"))   # 1.5% от базы
 HEADROOM_FRAC = float(os.environ.get("HL_DEPEG_HEADROOM_FRAC", "0.30"))  # доля съеденного запаса
 MIN_DEBT_USD = float(os.environ.get("HL_DEPEG_MIN_DEBT", "100000"))    # кто считается китом
+ESCALATION_STEP = float(os.environ.get("HL_DEPEG_ESCALATION_STEP", "0.10"))  # +10 п.п. съеденного
+REARM_H = float(os.environ.get("HL_DEPEG_REARM_H", "24"))              # срок годности подавления
 
 
 def read_ratios(rpc: Rpc) -> dict:
@@ -114,6 +125,43 @@ def assess(cur: dict, hist: list[dict]) -> dict:
     return out
 
 
+def should_realert(prev: dict | None, borrower: str, eaten: float, now: float,
+                   step: float = None, rearm_h: float = None) -> bool:
+    """Гейт повторной побудки: та же картина не будит дважды.
+
+    Состояние НЕ сбрасывается, когда условие тревоги временно гаснет: просвет — верхний
+    зуб той же шумовой пилы, и сброс по нему вернул бы побудку на каждом нижнем. Новая
+    побудка — только если картина ХУЖЕ последней доложенной (съедено выросло на ступень),
+    сменился ближайший кит, или подавление пережило свой срок годности (rearm_h).
+    """
+    step = ESCALATION_STEP if step is None else step
+    rearm_h = REARM_H if rearm_h is None else rearm_h
+    if not prev:
+        return True
+    if borrower != prev.get("borrower"):
+        return True
+    if eaten >= prev.get("eaten", 0.0) + step:
+        return True
+    if now - prev.get("ts", 0) >= rearm_h * 3600:
+        return True
+    return False
+
+
+def load_alert_state() -> dict | None:
+    try:
+        with open(ALERT_STATE_PATH) as f:
+            return json.load(f)
+    except Exception:                                                # noqa: BLE001
+        return None
+
+
+def save_alert_state(state: dict) -> None:
+    tmp = ALERT_STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, ensure_ascii=False)
+    os.replace(tmp, ALERT_STATE_PATH)
+
+
 def notify_agent(text: str, key: str) -> None:
     """Тревога адресована АГЕНТУ: пре-арм и разбор — его работа, человеку тут нечего подписывать."""
     try:
@@ -165,15 +213,28 @@ def main() -> int:
           if nearest else f"\nхудшая просадка {worst * 100:.3f}%")
 
     if worst >= DRAWDOWN_ALERT or (nearest and eaten >= HEADROOM_FRAC):
-        names = ", ".join(f"{s} {d['drawdown'] * 100:+.2f}%" for s, d in dd.items()
-                          if d["drawdown"] >= DRAWDOWN_ALERT / 2) or "—"
-        notify_agent(
-            f"📉 hyperlend: сжатие LST-ряда {worst * 100:.2f}% ({names}). "
-            f"Ближайший кит {whales[0]['borrower'][:10]}… HF={whales[0]['hf']:.4f}, "
-            f"запас {nearest * 100:.2f}% — съедено {eaten * 100:.0f}%. "
-            f"Проверить пре-арм и глубину выхода kHYPE→WHYPE.",
-            key="hl-depeg")
-        print("→ агент разбужен")
+        borrower = whales[0]["borrower"] if whales else ""
+        prev, now = load_alert_state(), time.time()
+        if should_realert(prev, borrower, eaten, now):
+            names = ", ".join(f"{s} {d['drawdown'] * 100:+.2f}%" for s, d in dd.items()
+                              if d["drawdown"] >= DRAWDOWN_ALERT / 2) or "—"
+            # китов может не быть вовсе (hotset не прочитался) — просадка всё равно
+            # должна доехать до агента, а не упасть тут на whales[0]
+            whale_part = (f"Ближайший кит {borrower[:10]}… HF={whales[0]['hf']:.4f}, "
+                          f"запас {nearest * 100:.2f}% — съедено {eaten * 100:.0f}%. "
+                          if whales else "Китов в горячем наборе НЕТ (проверить hotset). ")
+            notify_agent(
+                f"📉 hyperlend: сжатие LST-ряда {worst * 100:.2f}% ({names}). "
+                f"{whale_part}Проверить пре-арм и глубину выхода kHYPE→WHYPE.",
+                key="hl-depeg")
+            save_alert_state({"ts": int(now), "borrower": borrower,
+                              "eaten": round(eaten, 4), "worst": round(worst, 5)})
+            print("→ агент разбужен")
+        else:
+            print(f"→ побудка подавлена: картина не хуже доложенной "
+                  f"(съедено {eaten * 100:.0f}% против {prev.get('eaten', 0) * 100:.0f}% "
+                  f"в тревоге {time.strftime('%d.%m %H:%M', time.gmtime(prev.get('ts', 0)))}Z, "
+                  f"ступень {ESCALATION_STEP * 100:.0f} п.п., ре-арм {REARM_H:.0f}ч)")
     return 0
 
 
