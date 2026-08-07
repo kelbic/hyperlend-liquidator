@@ -28,8 +28,23 @@ from analysis.protocols import (POOL, ORACLE, TOKENS, ADDR_TO_SYMBOL, DECIMALS,
                                 TOPIC_LIQUIDATION_CALL)
 
 SEL_GET_ASSET_PRICE = "0xb3596f07"          # getAssetPrice(address) -> uint256 (base 1e8)
+# Оракул-апдейты, которые победитель может везти В СВОЕЙ tx (вскрытие 07.08, блок 42516651):
+# USDHL прайсится Pyth-адаптером, Pyth = пермишенлесс pull => победитель кладёт свежую цену
+# первым логом собственной ликвидации и пересекает HF<1 атомарно — отдельного пуш-tx нет,
+# push_idx пуст, реакция по подтверждённому состоянию не выигрывает такие гонки в принципе.
+TOPIC_PYTH_PRICE_UPDATE = "0xd06a6b7f4918494b3719217d1802786c1f5112a6c1d88fe2cfec00b4584f6aec"
+_TOPIC_ORACLE_UPDATES = {TOPIC_PYTH_PRICE_UPDATE, C.TOPIC_VALUE_UPDATE}
 _state = {"last_tick": 0.0}
 _price_cache: dict = {}                     # asset -> (price_usd, monotonic_ts)
+
+
+def _above_fire_floor(debt_usd: float | None, bonus_usd: float | None) -> bool:
+    """Пол «деньги прошли мимо» = наш собственный пол огня ЦЕЛИКОМ (канон dd19a4e):
+    и размер (MIN_DEBT_USD — ниже него позиция сознательно не в hot-set), и профит
+    (MIN_PROFIT_USD). None (цену добыть не удалось) агента не будит — запись в jsonl
+    остаётся безусловной, триаж дособерёт."""
+    return bool(debt_usd and bonus_usd
+                and debt_usd >= C.MIN_DEBT_USD and bonus_usd >= C.MIN_PROFIT_USD)
 
 
 def _now_iso() -> str:
@@ -104,7 +119,11 @@ def _enrich(rpc, events: list[dict], our_view: dict, st_snapshot: dict) -> None:
                        "to": (t.get("to") or "")[:14], "from": t["from"][:14],
                        "gas": int(rc["gasUsed"], 16), "st": int(rc["status"], 16),
                        "tip_gwei": round((int(rc["effectiveGasPrice"], 16) - base) / 1e9, 2),
-                       "inb": len(t.get("input", "0x")) // 2 - 1}
+                       "inb": len(t.get("input", "0x")) // 2 - 1,
+                       # оракул-апдейты внутри tx (Pyth PriceFeedUpdate / RS ValueUpdate):
+                       # upd>0 у победителя = атомарный self-push, гонка была невыигрываема
+                       "upd": sum(1 for lg in rc.get("logs", [])
+                                  if lg["topics"] and lg["topics"][0] in _TOPIC_ORACLE_UPDATES)}
                 anatomy.append(row)
                 if t["hash"] == e["tx"]:
                     win = row
@@ -126,15 +145,18 @@ def _enrich(rpc, events: list[dict], our_view: dict, st_snapshot: dict) -> None:
                    "win": win, "push_idx": push_idx, "block_txs": anatomy,
                    "ours": {"in_book": our_view.get("in_book", {}).get(e["victim"].lower()),
                             "in_hot": our_view.get("in_hot", {}).get(e["victim"].lower()),
+                            "size_ok": (debt_usd >= C.MIN_DEBT_USD) if debt_usd else None,
                             "floor_ok": (bal is not None
                                          and bal * 1e18 >= C.GAS_LIMIT * 2 * base) or None,
                             "guard": st_snapshot.get("guard")}}
             _append(rec)
-            if bonus_usd and bonus_usd >= C.MIN_PROFIT_USD:
+            if _above_fire_floor(debt_usd, bonus_usd):
+                self_push = f", self-push x{win['upd']}" if win and win.get("upd") else ""
                 _notify_inbox(
                     f"🏁 чужая ликвидация выше нашего пола: {rec['debt_sym']}->{sym_c} "
                     f"${debt_usd:,.0f} (бонус ~${bonus_usd:,.0f}) блок {e['block']} "
-                    f"tip {win['tip_gwei'] if win else '?'} gwei, победитель {e['liquidator'][:10]}; "
+                    f"tip {win['tip_gwei'] if win else '?'} gwei{self_push}, "
+                    f"победитель {e['liquidator'][:10]}; "
                     f"жертва in_hot={rec['ours']['in_hot']} — разобрать по shadow_races.jsonl",
                     key=f"shadow:{e['tx'][:18]}")
         except Exception as ex:              # noqa: BLE001 — телеметрия не смеет ронять поток
