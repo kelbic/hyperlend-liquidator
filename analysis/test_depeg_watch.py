@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from analysis.depeg_watch import should_realert
+from analysis.depeg_watch import assess, should_realert
 
 W1 = "0x2385233abb910357e2b97a16d40e0443e53d0769"
 W2 = "0x000000000000000000000000000000000000dead"
@@ -67,3 +67,29 @@ def test_no_reset_on_transient_clear():
 def test_empty_whales_borrower_change_fires():
     # киты пропали (hotset не прочитался) — borrower "" отличается от прежнего, будим
     assert should_realert(_st(0.38), "", 0.0, T0 + 3600, step=0.10, rearm_h=24)
+
+
+def _hist(*ratios: float) -> list[dict]:
+    return [{"ratios": {"kHYPE": r}} for r in ratios]
+
+
+def test_assess_inside_band_no_breakout():
+    # нижний зуб известной пилы: просадка от пика есть, но низ окна не пробит
+    dd = assess({"ratios": {"kHYPE": 1.0195}}, _hist(1.0255, 1.0190, 1.0250))
+    d = dd["kHYPE"]
+    assert d["drawdown"] > 0
+    assert d["floor"] == 1.019 and d["below_floor"] == 0.0
+
+
+def test_assess_breakout_below_floor():
+    # уход ниже низа окна — новая территория, глубина пробоя считается от низа
+    dd = assess({"ratios": {"kHYPE": 1.0100}}, _hist(1.0255, 1.0190, 1.0250))
+    d = dd["kHYPE"]
+    assert d["below_floor"] > 0
+    assert abs(d["below_floor"] - (1.0 - 1.0100 / 1.0190)) < 1e-5  # поле округлено до 5 знаков
+
+
+def test_assess_no_history_no_breakout():
+    # без истории низ = текущее значение, пробоя нет по построению
+    d = assess({"ratios": {"kHYPE": 1.02}}, [])["kHYPE"]
+    assert d["floor"] == 1.02 and d["below_floor"] == 0.0 and d["samples"] == 0

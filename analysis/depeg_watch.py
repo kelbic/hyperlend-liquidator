@@ -114,13 +114,24 @@ def load_history(hours: float) -> list[dict]:
 
 
 def assess(cur: dict, hist: list[dict]) -> dict:
-    """Просадка каждого отношения от максимума окна. Для растущего ряда максимум = база."""
+    """Просадка каждого отношения от максимума окна. Для растущего ряда максимум = база.
+
+    Ряд kHYPE на деле не монотонен: фид — композит (prim:redstone/fundam,
+    sec:chainlink/fundam, emerg:redstone/market), и отношение ходит меандром ~±0.5%
+    (полоса ~1.0195–1.0255, замер 05–08.08; гипотеза — переключение источников, не
+    доказано: аксессоры под-фидов закрыты). Поэтому кроме пика окна считаем его НИЗ:
+    просадка внутри известной полосы — привычная пила, пробой ниже низа — новая
+    территория. Низ окна сам дрейфует вместе с полосой, так что «внутри полосы» —
+    контекст для разбора, не отбой: решающей метрикой остаётся съеденный запас."""
     out = {}
     for s, r in cur["ratios"].items():
         past = [h["ratios"][s] for h in hist if s in (h.get("ratios") or {})]
         peak = max(past + [r])
+        floor = min(past) if past else r
         out[s] = {"ratio": round(r, 6), "peak": round(peak, 6),
                   "drawdown": round(1.0 - r / peak, 5) if peak else 0.0,
+                  "floor": round(floor, 6),
+                  "below_floor": round(max(0.0, 1.0 - r / floor), 5) if past else 0.0,
                   "samples": len(past)}
     return out
 
@@ -206,11 +217,16 @@ def main() -> int:
         print("\nкитов в горячем наборе нет")
 
     worst = max((d["drawdown"] for d in dd.values()), default=0.0)
+    worst_sym = max(dd, key=lambda s: dd[s]["drawdown"]) if dd else None
+    band = dd.get(worst_sym) or {}
+    band_note = (f"ПРОБОЙ низа окна на {band['below_floor'] * 100:.2f}% — новая территория"
+                 if band.get("below_floor", 0.0) > 0
+                 else f"внутри полосы окна (низ {band.get('floor', 0.0):.6f} не пробит)")
     nearest = whales[0]["headroom"] if whales else None
     eaten = (worst / nearest) if (nearest and nearest > 0) else 0.0
-    print(f"\nхудшая просадка {worst * 100:.3f}%; "
-          f"ближайший запас {nearest * 100:.2f}%; съедено {eaten * 100:.1f}% запаса"
-          if nearest else f"\nхудшая просадка {worst * 100:.3f}%")
+    print(f"\nхудшая просадка {worst * 100:.3f}% ({worst_sym}: {band_note}); "
+          + (f"ближайший запас {nearest * 100:.2f}%; съедено {eaten * 100:.1f}% запаса"
+             if nearest else ""))
 
     if worst >= DRAWDOWN_ALERT or (nearest and eaten >= HEADROOM_FRAC):
         borrower = whales[0]["borrower"] if whales else ""
@@ -224,7 +240,7 @@ def main() -> int:
                           f"запас {nearest * 100:.2f}% — съедено {eaten * 100:.0f}%. "
                           if whales else "Китов в горячем наборе НЕТ (проверить hotset). ")
             notify_agent(
-                f"📉 hyperlend: сжатие LST-ряда {worst * 100:.2f}% ({names}). "
+                f"📉 hyperlend: сжатие LST-ряда {worst * 100:.2f}% ({names}; {band_note}). "
                 f"{whale_part}Проверить пре-арм и глубину выхода kHYPE→WHYPE.",
                 key="hl-depeg")
             save_alert_state({"ts": int(now), "borrower": borrower,
