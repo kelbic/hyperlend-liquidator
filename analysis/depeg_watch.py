@@ -11,10 +11,29 @@
     сжатие_до_падения = 1 − 1/HF
 (HF 1.0640 -> 6.0%; сходится с наблюдением «киты падают на 5-6%»).
 
-Что делает вотч: раз в час пишет снимок отношений и запас каждого кита, сравнивает текущее
-отношение с максимумом скользящего окна (для растущего ряда максимум и есть база), и когда
-просадка от базы съедает заметную долю запаса ближайшего кита — будит АГЕНТА (не человека:
-он тут ничего не подписывает — канон [[alerts-only-where-human-acts]]).
+Что делает вотч: раз в час пишет снимок отношений и запас каждого кита и будит АГЕНТА
+(не человека: он тут ничего не подписывает — канон [[alerts-only-where-human-acts]]).
+
+ЧТО СЧИТАЕТСЯ ПОВОДОМ (переделано 15.08 — см. ниже). Прежняя решающая метрика — «просадка
+от максимума окна, делённая на запас ближайшего кита» — оказалась откалибрована по ШУМУ.
+Отношение kHYPE/WHYPE стационарно и ходит узкой полосой: за 198ч замера весь размах
+1.01% (1.017416–1.027747), худший часовой шаг вниз −0.71%, худшая просадка за любые 6ч
+−0.69%. Просадка-от-пика поэтому НАСЫЩАЕТСЯ на ширине полосы B≈1.01% и перестаёт зависеть
+от опасности: при запасе кита H тревога «съедено ≥30%» структурно неизбежна, как только
+H ≤ B/0.30 = 3.35%. У ближайшего кита H=2.51% ⇒ условие истинно 10% часов, порог сидит
+ровно на p90 стационарного распределения, и ре-арм раз в сутки превращал это в ежедневную
+побудку ни о чём: 7 срабатываний за 05–15.08, ВСЕ с «сжатием» 0.75–0.96% (= ширина полосы)
+и НИ ОДНОГО пробоя низа. Это ровно тот класс дефекта, что уже назван в
+[[emptiness-alarm-needs-measured-rate]]: тревога на медиане тишины.
+
+Решающих метрик теперь три, и все меряют СОБЫТИЕ, а не положение внутри полосы:
+  1. пробой НИЗА окна (below_floor) — новая территория; доля съеденного запаса считается
+     от него, а не от просадки-от-пика, поэтому привычная пила больше не будит;
+  2. абсолютная просадка ≥ DRAWDOWN_ALERT (1.5% — заведомо шире полосы 1.01%);
+  3. абсолютный запас ближайшего кита ≤ HEADROOM_ABS (1.5% ≈ два худших часовых шага до
+     воды). Этого триггера прежней схеме НЕ ХВАТАЛО: низ окна дрейфует вместе с полосой,
+     поэтому медленное сползание пробоя не даёт, а запас — не врёт. Кит, припаркованный
+     под этим порогом, будет будить раз в сутки: это не спам, а кромка.
 
 Повторная побудка — только по ЭСКАЛАЦИИ. Отношение ходит шумовой полосой ~0.8% с периодом
 в часы (07.08: два подъёма агента за ночь на ОДНОЙ картине, второй — на менее тяжёлой),
@@ -51,6 +70,9 @@ BASE = "WHYPE"
 WINDOW_H = float(os.environ.get("HL_DEPEG_WINDOW_H", "168"))     # окно базы, часов (7 суток)
 DRAWDOWN_ALERT = float(os.environ.get("HL_DEPEG_DRAWDOWN", "0.015"))   # 1.5% от базы
 HEADROOM_FRAC = float(os.environ.get("HL_DEPEG_HEADROOM_FRAC", "0.30"))  # доля съеденного запаса
+# Абсолютный порог запаса: 1.5% ≈ два худших часовых шага (−0.71%) до воды. Замер 15.08 по
+# 198ч истории; ближайший кит сейчас 2.51%, то есть порог НЕ горит на текущей картине.
+HEADROOM_ABS = float(os.environ.get("HL_DEPEG_HEADROOM_ABS", "0.015"))
 MIN_DEBT_USD = float(os.environ.get("HL_DEPEG_MIN_DEBT", "100000"))    # кто считается китом
 ESCALATION_STEP = float(os.environ.get("HL_DEPEG_ESCALATION_STEP", "0.10"))  # +10 п.п. съеденного
 REARM_H = float(os.environ.get("HL_DEPEG_REARM_H", "24"))              # срок годности подавления
@@ -136,8 +158,42 @@ def assess(cur: dict, hist: list[dict]) -> dict:
     return out
 
 
+def decide(dd: dict, whales: list[dict], drawdown_alert: float = None,
+           headroom_frac: float = None, headroom_abs: float = None) -> dict:
+    """Решение «будить или нет» — чистая функция, чтобы её можно было проверить тестом.
+
+    Числитель доли съеденного запаса — ПРОБОЙ НИЗА окна (новая территория), а НЕ просадка
+    от пика: просадка-от-пика насыщается на ширине полосы и потому будит на медиане тишины
+    (обоснование и замер — в шапке модуля). Просадка-от-пика осталась только как (а) быстрый
+    абсолютный триггер на движение шире полосы и (б) контекст в тексте тревоги.
+    """
+    drawdown_alert = DRAWDOWN_ALERT if drawdown_alert is None else drawdown_alert
+    headroom_frac = HEADROOM_FRAC if headroom_frac is None else headroom_frac
+    headroom_abs = HEADROOM_ABS if headroom_abs is None else headroom_abs
+
+    worst = max((d["drawdown"] for d in dd.values()), default=0.0)
+    worst_sym = max(dd, key=lambda s: dd[s]["drawdown"]) if dd else None
+    breach = max((d.get("below_floor", 0.0) for d in dd.values()), default=0.0)
+    breach_sym = (max(dd, key=lambda s: dd[s].get("below_floor", 0.0))
+                  if breach > 0 else None)
+    nearest = whales[0]["headroom"] if whales else None
+    eaten = (breach / nearest) if (nearest and nearest > 0) else 0.0
+
+    if worst >= drawdown_alert:
+        reason = "drawdown"
+    elif nearest and nearest > 0 and eaten >= headroom_frac:
+        reason = "breach_eats_headroom"
+    elif nearest is not None and 0 < nearest <= headroom_abs:
+        reason = "headroom_abs"
+    else:
+        reason = ""
+    return {"fire": bool(reason), "reason": reason, "worst": worst, "worst_sym": worst_sym,
+            "breach": breach, "breach_sym": breach_sym, "nearest": nearest, "eaten": eaten}
+
+
 def should_realert(prev: dict | None, borrower: str, eaten: float, now: float,
-                   step: float = None, rearm_h: float = None) -> bool:
+                   step: float = None, rearm_h: float = None,
+                   reason: str = None) -> bool:
     """Гейт повторной побудки: та же картина не будит дважды.
 
     Состояние НЕ сбрасывается, когда условие тревоги временно гаснет: просвет — верхний
@@ -150,6 +206,12 @@ def should_realert(prev: dict | None, borrower: str, eaten: float, now: float,
     if not prev:
         return True
     if borrower != prev.get("borrower"):
+        return True
+    # Смена ПРИЧИНЫ — другая картина, а не та же хуже/лучше: пробой низа и «кит на кромке»
+    # требуют разного разбора. Состояние старого формата поля не имеет (prev.get -> None):
+    # тогда сравнение считаем несостоявшимся и падаем на сторону ПОБУДКИ, а не тишины
+    # (канон [[unknown-must-close-the-gate]] — незнание не даёт права молчать).
+    if reason is not None and reason != prev.get("reason", None):
         return True
     if eaten >= prev.get("eaten", 0.0) + step:
         return True
@@ -216,34 +278,41 @@ def main() -> int:
     else:
         print("\nкитов в горячем наборе нет")
 
-    worst = max((d["drawdown"] for d in dd.values()), default=0.0)
-    worst_sym = max(dd, key=lambda s: dd[s]["drawdown"]) if dd else None
+    v = decide(dd, whales)
+    worst, worst_sym = v["worst"], v["worst_sym"]
+    nearest, eaten = v["nearest"], v["eaten"]
     band = dd.get(worst_sym) or {}
-    band_note = (f"ПРОБОЙ низа окна на {band['below_floor'] * 100:.2f}% — новая территория"
-                 if band.get("below_floor", 0.0) > 0
+    band_note = (f"ПРОБОЙ низа окна на {v['breach'] * 100:.2f}% — новая территория"
+                 if v["breach"] > 0
                  else f"внутри полосы окна (низ {band.get('floor', 0.0):.6f} не пробит)")
-    nearest = whales[0]["headroom"] if whales else None
-    eaten = (worst / nearest) if (nearest and nearest > 0) else 0.0
     print(f"\nхудшая просадка {worst * 100:.3f}% ({worst_sym}: {band_note}); "
-          + (f"ближайший запас {nearest * 100:.2f}%; съедено {eaten * 100:.1f}% запаса"
-             if nearest else ""))
+          + (f"ближайший запас {nearest * 100:.2f}%; новой территорией съедено "
+             f"{eaten * 100:.1f}% запаса" if nearest else "")
+          + (f" => повод: {v['reason']}" if v["fire"] else " => повода нет"))
 
-    if worst >= DRAWDOWN_ALERT or (nearest and eaten >= HEADROOM_FRAC):
+    if v["fire"]:
         borrower = whales[0]["borrower"] if whales else ""
         prev, now = load_alert_state(), time.time()
-        if should_realert(prev, borrower, eaten, now):
+        if should_realert(prev, borrower, eaten, now, reason=v["reason"]):
             names = ", ".join(f"{s} {d['drawdown'] * 100:+.2f}%" for s, d in dd.items()
                               if d["drawdown"] >= DRAWDOWN_ALERT / 2) or "—"
             # китов может не быть вовсе (hotset не прочитался) — просадка всё равно
             # должна доехать до агента, а не упасть тут на whales[0]
             whale_part = (f"Ближайший кит {borrower[:10]}… HF={whales[0]['hf']:.4f}, "
-                          f"запас {nearest * 100:.2f}% — съедено {eaten * 100:.0f}%. "
+                          f"запас {nearest * 100:.2f}% — новой территорией съедено "
+                          f"{eaten * 100:.0f}%. "
                           if whales else "Китов в горячем наборе НЕТ (проверить hotset). ")
+            why = {"drawdown": f"просадка {worst * 100:.2f}% шире полосы",
+                   "breach_eats_headroom": "пробой низа съел запас кита",
+                   "headroom_abs": f"кит НА КРОМКЕ: запас ≤ {HEADROOM_ABS * 100:.1f}%",
+                   }.get(v["reason"], v["reason"])
             notify_agent(
-                f"📉 hyperlend: сжатие LST-ряда {worst * 100:.2f}% ({names}; {band_note}). "
+                f"📉 hyperlend [{why}]: сжатие LST-ряда {worst * 100:.2f}% "
+                f"({names}; {band_note}). "
                 f"{whale_part}Проверить пре-арм и глубину выхода kHYPE→WHYPE.",
                 key="hl-depeg")
-            save_alert_state({"ts": int(now), "borrower": borrower,
+            save_alert_state({"ts": int(now), "borrower": borrower, "reason": v["reason"],
+                              "headroom": round(nearest, 5) if nearest else None,
                               "eaten": round(eaten, 4), "worst": round(worst, 5)})
             print("→ агент разбужен")
         else:
