@@ -34,6 +34,7 @@ SEL_GET_ASSET_PRICE = "0xb3596f07"          # getAssetPrice(address) -> uint256 
 # push_idx пуст, реакция по подтверждённому состоянию не выигрывает такие гонки в принципе.
 TOPIC_PYTH_PRICE_UPDATE = "0xd06a6b7f4918494b3719217d1802786c1f5112a6c1d88fe2cfec00b4584f6aec"
 _TOPIC_ORACLE_UPDATES = {TOPIC_PYTH_PRICE_UPDATE, C.TOPIC_VALUE_UPDATE}
+ANATOMY_MAX_TX = 12                         # потолок разбора блока; превышение помечается trunc
 _state = {"last_tick": 0.0}
 _price_cache: dict = {}                     # asset -> (price_usd, monotonic_ts)
 
@@ -90,6 +91,39 @@ def _asset_price_usd(rpc, asset: str) -> float | None:
         return None
 
 
+def _push_indices(anatomy: list[dict]) -> list[int]:
+    """Индексы tx блока, которые РЕАЛЬНО двинули оракул — по факту события в квитанции
+    (upd>0), а не по силуэту tx.
+
+    Прежняя эвристика (`st==1 and inb>=600 and 100k<=gas<=600k and to!=POOL`) на блоке
+    43827262 промахнулась в обе стороны: настоящий пуш RedStone (idx 1, adapter
+    0xe4ae8874, релейер 0x2327c3cd) имел inb=581 и НЕ прошёл порог 600, а помечен был
+    посторонний idx 4 с inb=1540 и upd=0. Счётчик upd — тот же самый честный признак,
+    которым 07.08 опознан атомарный self-push; здесь он просто применён и к соседям.
+
+    Названный предел: видны пуши тех оракулов, чьи топики в _TOPIC_ORACLE_UPDATES
+    (RedStone ValueUpdate + Pyth PriceFeedUpdate). Оба — это ровно те оракулы, которыми
+    HyperLend прайсит свои резервы (getSourceOfAsset, замер 07.08); пуш третьего оракула
+    остался бы невидимым, и это надо будет закрывать топиком, а не силуэтом."""
+    return [r["idx"] for r in anatomy if r.get("upd")]
+
+
+def _bonus_usd(debt_usd: float | None, seized_usd: float | None,
+               coll_sym: str) -> tuple[float | None, str]:
+    """Валовая премия победителя. ЗАМЕР сильнее модели: (seized - cover) в долларах — это
+    то, что ликвидатор реально получил сверх погашенного, со всеми поправками уже внутри
+    (close factor, liquidationProtocolFee, eMode-бонус, пыльные добивания). Модель
+    `debt*(bonus_bps-1)*0.9` остаётся ФОЛБЭКОМ на случай, когда цену залога добыть не
+    удалось: она угадывает конфигурационный бонус и протокольную комиссию, а на 43827262
+    сошлась с замером ($2,491.5) лишь потому, что обе поправки там совпали с прошитыми."""
+    if debt_usd and seized_usd:
+        return max(0.0, seized_usd - debt_usd), "measured"
+    if debt_usd:
+        bps = TOKENS.get(coll_sym, {}).get("bonus_bps", 11000)
+        return debt_usd * max(0, bps - 10000) / 1e4 * 0.9, "modelled"
+    return None, "none"
+
+
 def _notify_inbox(text: str, key: str) -> None:
     """Инбокс агента; недоступность нотификатора — лог, не падение (телеметрия важнее)."""
     try:
@@ -117,11 +151,21 @@ def _enrich(rpc, events: list[dict], our_view: dict, st_snapshot: dict) -> None:
         try:
             blk = rpc.get_block(e["block"], True)
             base = int(blk.get("baseFeePerGas", "0x0"), 16)
-            txs = blk.get("transactions", [])[:12]
-            anatomy, win = [], None
-            for t in txs:
+            all_txs = blk.get("transactions", [])
+            txs = all_txs[:ANATOMY_MAX_TX]
+            anatomy, win, shift = [], None, False
+            for pos, t in enumerate(txs):
                 rc = rpc.call("eth_getTransactionReceipt", [t["hash"]])
-                row = {"idx": int(t["transactionIndex"], 16),
+                # idx берётся из КВИТАНЦИИ, не из позиции в листинге блока (вскрытие 22.08,
+                # блок 43827262): rpc.hyperliquid.xyz/evm и drpc опускают системные tx
+                # HyperCore (gasPrice=0, gasUsed=0) из eth_getBlockByNumber, а квитанция
+                # несёт каноничный индекс. У официального узла листинг и квитанция съезжают
+                # согласованно (он перенумеровывает) — расхождение фиксируется флагом
+                # idx_shift, чтобы неоднозначность жила В ДАННЫХ, а не в комментарии.
+                idx = int(rc["transactionIndex"], 16)
+                if idx != pos:
+                    shift = True
+                row = {"idx": idx,
                        "to": (t.get("to") or "")[:14], "from": t["from"][:14],
                        "gas": int(rc["gasUsed"], 16), "st": int(rc["status"], 16),
                        "tip_gwei": round((int(rc["effectiveGasPrice"], 16) - base) / 1e9, 2),
@@ -133,22 +177,26 @@ def _enrich(rpc, events: list[dict], our_view: dict, st_snapshot: dict) -> None:
                 anatomy.append(row)
                 if t["hash"] == e["tx"]:
                     win = row
-            push_idx = [r["idx"] for r in anatomy
-                        if r["st"] == 1 and r["inb"] >= 600 and 100_000 <= r["gas"] <= 600_000
-                        and r["to"].lower() != POOL[:14].lower()]
+            push_idx = _push_indices(anatomy)
             dpx = _asset_price_usd(rpc, e["debt"])
             dec = DECIMALS.get(e["debt"].lower())
             debt_usd = (e["cover"] / 10 ** dec * dpx) if (dpx and dec is not None) else None
             sym_c = ADDR_TO_SYMBOL.get(e["coll"].lower(), e["coll"][:10])
-            bonus_bps = TOKENS.get(sym_c, {}).get("bonus_bps", 11000)
-            bonus_usd = (debt_usd * max(0, bonus_bps - 10000) / 1e4 * 0.9) if debt_usd else None
+            cpx = _asset_price_usd(rpc, e["coll"])
+            cdec = DECIMALS.get(e["coll"].lower())
+            seized_usd = (e["seized"] / 10 ** cdec * cpx) if (cpx and cdec is not None) else None
+            bonus_usd, bonus_src = _bonus_usd(debt_usd, seized_usd, sym_c)
             bal = st_snapshot.get("balance_hype")
             rec = {"iso": _now_iso(), **e,
                    "coll_sym": sym_c, "debt_sym": ADDR_TO_SYMBOL.get(e["debt"].lower(), e["debt"][:10]),
                    "debt_usd": round(debt_usd, 2) if debt_usd else None,
+                   "seized_usd": round(seized_usd, 2) if seized_usd else None,
                    "bonus_usd_est": round(bonus_usd, 2) if bonus_usd else None,
+                   "bonus_src": bonus_src,
                    "base_gwei": round(base / 1e9, 3),
                    "win": win, "push_idx": push_idx, "block_txs": anatomy,
+                   "ntx": len(all_txs), "trunc": len(all_txs) > ANATOMY_MAX_TX,
+                   "idx_shift": shift,
                    "ours": {"in_book": our_view.get("in_book", {}).get(e["victim"].lower()),
                             "in_hot": our_view.get("in_hot", {}).get(e["victim"].lower()),
                             "size_ok": (debt_usd >= C.MIN_DEBT_USD) if debt_usd else None,

@@ -62,6 +62,157 @@ def test_upd_counting_shape() -> None:
     assert n == 2
 
 
+# --------------------------------------------------------------------- вскрытие 22.08 (43827262)
+# ФИКСТУРА — ЗАМЕР, не самоотчёт продукта: анатомия блока 43827262 прочитана с цепи
+# (rpc.hyperlend.finance, полный листинг из 6 tx; drpc/официальный узел прячут системную
+# tx HyperCore на idx 0 — см. _enrich). Ровно на ней прежняя эвристика push_idx промахнулась.
+BLK_43827262 = [
+    # системная tx HyperCore: gasPrice 0, gasUsed 0 — её не видят два из трёх узлов
+    {"idx": 0, "to": "0xb88339cb7199", "from": "0x6b9e773128f4", "gas": 0, "st": 1,
+     "tip_gwei": -5.28, "inb": 68, "upd": 0},
+    {"idx": 1, "to": "0x1d90dbcf3072", "from": "0x830470bd27af", "gas": 841248, "st": 1,
+     "tip_gwei": 8.98, "inb": 3524, "upd": 0},
+    # НАСТОЯЩИЙ пуш RedStone: адаптер 0xe4ae8874, релейер 0x2327c3cd, ValueUpdate(HYPE)
+    {"idx": 2, "to": "0xe4ae88743c38", "from": "0x2327c3cdc64c", "gas": 65951, "st": 1,
+     "tip_gwei": 1.13, "inb": 581, "upd": 1},
+    # победитель — ликвидация в ТОМ ЖЕ блоке, tip НИЖЕ пуша (техника lag=0)
+    {"idx": 3, "to": "0x2f18fc900071", "from": "0xa8b4d313b3de", "gas": 617099, "st": 1,
+     "tip_gwei": 0.10, "inb": 164, "upd": 0},
+    # проигравший тем же контрактом с другого EOA — реверт по HF после победителя
+    {"idx": 4, "to": "0x2f18fc900071", "from": "0x4dc3b0e827b0", "gas": 372106, "st": 0,
+     "tip_gwei": 0.10, "inb": 164, "upd": 0},
+    {"idx": 5, "to": "0x000000000000", "from": "0x0af2f002d3d3", "gas": 166718, "st": 1,
+     "tip_gwei": 0.10, "inb": 1540, "upd": 0},
+]
+
+
+def _legacy_push_idx(anatomy):
+    """Эвристика ДО фикса 22.08 — держится в тестах как НЕГАТИВНЫЙ КОНТРОЛЬ: если она на
+    фикстуре даёт тот же ответ, что новая, фикстура дефект не воспроизводит и тест пуст."""
+    from analysis.protocols import POOL
+    return [r["idx"] for r in anatomy
+            if r["st"] == 1 and r["inb"] >= 600 and 100_000 <= r["gas"] <= 600_000
+            and r["to"].lower() != POOL[:14].lower()]
+
+
+def test_push_idx_from_measured_update_event() -> None:
+    # новая функция берёт ровно tx с оракул-событием
+    assert S._push_indices(BLK_43827262) == [2]
+    # НЕГАТИВНЫЙ КОНТРОЛЬ: прежняя эвристика на этой же фикстуре промахивалась в обе
+    # стороны — теряла настоящий пуш (inb=581 < 600) и метила посторонний idx 5
+    legacy = _legacy_push_idx(BLK_43827262)
+    assert 2 not in legacy, "фикстура не воспроизводит промах — тест бесполезен"
+    assert legacy == [5]
+
+
+def test_push_idx_sees_atomic_self_push() -> None:
+    """Прецедент 07.08 (42516651): победитель везёт апдейт Pyth в СВОЕЙ же tx — его
+    индекс обязан попасть в push_idx, иначе «атомарный self-push» снова читается как
+    «пуша рядом не было»."""
+    anatomy = [{"idx": 0, "to": "0xabcdebae0000", "from": "0xabcdebae0000", "gas": 500_000,
+                "st": 1, "tip_gwei": 1.4, "inb": 900, "upd": 1}]
+    assert S._push_indices(anatomy) == [0]
+
+
+def test_push_idx_empty_when_no_oracle_tx() -> None:
+    assert S._push_indices([r for r in BLK_43827262 if not r["upd"]]) == []
+
+
+def test_bonus_measured_beats_model() -> None:
+    """Замер (seized-cover) — эталон; модель остаётся фолбэком без цены залога."""
+    debt_usd, seized_usd = 18455.43, 20946.91          # с цепи, блок 43827262
+    v, src = S._bonus_usd(debt_usd, seized_usd, "wstHYPE")
+    assert src == "measured" and abs(v - 2491.48) < 1.0
+    # цену залога добыть не удалось -> модель, помеченная как модель
+    v2, src2 = S._bonus_usd(debt_usd, None, "wstHYPE")
+    assert src2 == "modelled" and v2 > 0
+    # ни того ни другого -> None, и такой бонус не будит (гейт _above_fire_floor)
+    v3, src3 = S._bonus_usd(None, None, "wstHYPE")
+    assert v3 is None and src3 == "none" and not S._above_fire_floor(None, v3)
+    # отрицательной премии не бывает: сейз меньше погашенного -> 0, не будит
+    v4, _ = S._bonus_usd(1000.0, 900.0, "wstHYPE")
+    assert v4 == 0.0 and not S._above_fire_floor(1000.0, v4)
+
+
+def test_enrich_idx_from_receipt_and_block_meta() -> None:
+    """Шов проверяется НА САМОЙ _enrich, не на помощнике: узел отдаёт листинг блока без
+    системной tx, а квитанции несут каноничные индексы — запись обязана взять индексы
+    квитанций и поднять idx_shift."""
+    from analysis.protocols import ORACLE
+
+    base = 5_275_000_000
+    # листинг узла: 5 tx (системная скрыта), квитанции нумеруют от 0..5 (каноничные)
+    hidden = {0: None}
+    listed = [r for r in BLK_43827262 if r["idx"] != 0]
+    txs = [{"hash": "0x%064x" % r["idx"], "transactionIndex": hex(i),
+            "to": r["to"], "from": r["from"], "input": "0x" + "ab" * r["inb"]}
+           for i, r in enumerate(listed)]
+    by_hash = {t["hash"]: r for t, r in zip(txs, listed)}
+
+    class FakeRpc:
+        def get_block(self, n, full=False):
+            return {"baseFeePerGas": hex(base), "transactions": txs}
+
+        def call(self, method, params):
+            r = by_hash[params[0]]
+            return {"transactionIndex": hex(r["idx"]), "gasUsed": hex(r["gas"]),
+                    "status": hex(r["st"]),
+                    "effectiveGasPrice": hex(base + int(r["tip_gwei"] * 1e9)),
+                    "logs": [{"address": "0xe4ae88743c3834d0c492eabc47384c84bcadc6a6",
+                              "topics": [C.TOPIC_VALUE_UPDATE]}] * r["upd"]}
+
+        def eth_call(self, to, data, tag="latest"):
+            assert to == ORACLE
+            return hex(int(81.318638 * 1e8))          # wstHYPE, обе ноги события
+
+    S._price_cache.clear()
+    written, woke = [], []
+    orig_append, orig_notify = S._append, S._notify_inbox
+    S._append = written.append
+    S._notify_inbox = lambda text, key: woke.append((text, key))
+    try:
+        ev = {"block": 43827262,
+              "tx": "0x%064x" % 3,                     # победитель
+              "coll": "0x94e8396e0869c9f2200760af0621afd240e1cf38",
+              "debt": "0x94e8396e0869c9f2200760af0621afd240e1cf38",
+              "victim": "0xaf421e572b76d6c4596d4fea0faee7e742706dfa",
+              "cover": 226952081207627508270, "seized": 257590612170657221887,
+              "liquidator": "0x2f18fc900071bb73b6b2e73d910f3ee154f1a0ab"}
+        S._enrich(FakeRpc(), [ev], {"in_book": {}, "in_hot": {}},
+                  {"balance_hype": 0.156803, "guard": "ok"})
+    finally:
+        S._append, S._notify_inbox = orig_append, orig_notify
+        S._price_cache.clear()
+
+    assert len(written) == 1 and "err" not in written[0], written
+    rec = written[0]
+    # индексы — каноничные (из квитанций), несмотря на укороченный листинг
+    assert [r["idx"] for r in rec["block_txs"]] == [1, 2, 3, 4, 5]
+    assert rec["idx_shift"] is True, "съезд листинга и квитанций обязан быть виден в данных"
+    assert rec["ntx"] == 5 and rec["trunc"] is False
+    # пуш опознан по событию, победитель — по хэшу
+    assert rec["push_idx"] == [2]
+    assert rec["win"]["idx"] == 3 and rec["win"]["upd"] == 0
+    # премия — ЗАМЕР
+    assert rec["bonus_src"] == "measured"
+    assert abs(rec["bonus_usd_est"] - 2491.5) < 2.0
+    assert abs(rec["debt_usd"] - 18455.4) < 2.0
+    assert len(woke) == 1 and "43827262" in woke[0][0]
+
+    # НЕГАТИВНЫЙ КОНТРОЛЬ шва: узел без съезда не поднимает флаг
+    S._price_cache.clear()
+    written2 = []
+    S._append, S._notify_inbox = written2.append, lambda *a, **k: None
+    try:
+        for i, t in enumerate(txs):
+            by_hash[t["hash"]] = dict(by_hash[t["hash"]], idx=i)
+        S._enrich(FakeRpc(), [ev], {"in_book": {}, "in_hot": {}}, {"balance_hype": 0.1, "guard": "ok"})
+    finally:
+        S._append, S._notify_inbox = orig_append, orig_notify
+        S._price_cache.clear()
+    assert written2[0]["idx_shift"] is False
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

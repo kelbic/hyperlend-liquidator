@@ -156,6 +156,48 @@ def test_plan_same_asset_self_cancels(caches):
     assert spec.plan(_acct(1.01), _t(_WHYPE, _WHYPE)) is None
 
 
+def test_plan_same_asset_does_NOT_self_cancel_when_shares_differ(caches, monkeypatch):
+    """Вскрытие 22.08, блок 43827262. Docstring слоя обещал, что coll==debt «самогасится»
+    (s_c==s_d => HF_est==HF). Это верно только при f_c==f_d, т.е. для ОДНОАКТИВНОЙ позиции.
+
+    Живая цель держала залог wstHYPE 387.073314 + USDT0 421.62 + USDC 18,633.22, а долг —
+    ЦЕЛИКОМ wstHYPE 453.904170: f_c=0.6217, f_d=1.0. Пуш HYPE +0.5039% поднял обе ноги
+    одинаково, но долг вырос ВЕСЬ, а залог только на 62% — HF 1.001465 -> 0.999608 (цепь),
+    и чужой ликвидатор взял $2,491 бонуса в том же блоке. Числа ниже — с цепи.
+
+    Тест пришпиливает ДВА факта: формула такую цель видит, а связывающим пределом остаётся
+    порог C.SPEC_HF_FIRE."""
+    HF, TC, TD = 1.001465, 50_371.61, 36_725.80
+    PX_WST, PX_HYPE_BEFORE, PX_HYPE_AFTER = 80.910910, 78.370100, 78.764632
+    HF_ONCHAIN_AFTER = 0.999608          # эталон: пересчёт состава по ценам блока 43827262
+    EST_ERR = 5e-5                       # замеренная погрешность оценщика на 4 пересечениях
+
+    acct = {"health_factor": int(HF * 1e18),
+            "total_collateral_base": int(TC * 1e8), "total_debt_base": int(TD * 1e8)}
+    t = {"coll_asset": _WSTHYPE, "debt_asset": _WSTHYPE,
+         "coll_wei": int(387.073314 * 1e18), "coll_price": int(PX_WST * 1e8), "coll_dec": 18,
+         "debt_wei": int(453.904170 * 1e18), "debt_price": int(PX_WST * 1e8), "debt_dec": 18}
+    now_ms = int(time.time() * 1000)
+    with spec._lock:
+        spec._gw["HYPE"] = _feed_cache("HYPE", PX_HYPE_AFTER, now_ms - 5_000)
+        spec._chain[(_A, "HYPE")] = {"value": int(PX_HYPE_BEFORE * 1e8), "ts_ms": now_ms - 240_000}
+        # вторая нога фасада стоит на месте — её масштаб 1 (пуш её не вёз)
+        spec._gw["wstHYPE_FUNDAMENTAL"] = _feed_cache("wstHYPE_FUNDAMENTAL", 1.032421, now_ms - 5_000)
+        spec._chain[(_A, "wstHYPE_FUNDAMENTAL")] = {"value": int(1.032421 * 1e8),
+                                                    "ts_ms": now_ms - 240_000}
+
+    # 1) при БОЕВОМ пороге 0.998 плана нет — это и есть причина молчания слоя 22.08
+    assert C.SPEC_HF_FIRE == 0.998, "тест пришпилен к боевому порогу; порог сменился — перечитать вывод"
+    assert spec.plan(acct, t) is None
+
+    # 2) оценщик саму цель ВИДИТ и попадает в цепь: «самогашение» здесь не наступает
+    monkeypatch.setattr(C, "SPEC_HF_FIRE", 1.0)
+    p = spec.plan(acct, t)
+    assert p is not None and p["feeds"] == ["HYPE"]
+    assert p["hf_est"] == pytest.approx(HF_ONCHAIN_AFTER, abs=EST_ERR)
+    assert p["hf_est"] < 1.0 < HF, "цель пересекла воду именно за счёт разных долей f_c/f_d"
+
+
 def test_plan_wsthype_composes_two_feeds(caches):
     """wstHYPE = wstHYPE_FUNDAMENTAL * HYPE (доказано 04.08): двигаются оба фида — масштабы
     перемножаются, и оба входят в пуш-набор."""
