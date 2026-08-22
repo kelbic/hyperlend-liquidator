@@ -54,6 +54,24 @@ def _above_fire_floor(debt_usd: float | None, bonus_usd: float | None) -> bool:
                 and debt_usd >= C.MIN_DEBT_USD and bonus_usd >= C.MIN_PROFIT_USD)
 
 
+def _floor_ok(bal: float | None, base: int) -> bool | None:
+    """Хватало ли газового поплавка на конверт комиссии в ЭТОМ блоке.
+
+    Было `(bal is not None and bal * 1e18 >= C.GAS_LIMIT * 2 * base) or None`, и это
+    стирало ОТВЕТ: питоновский `False or None` даёт None, поэтому поле не могло принять
+    значение False НИКОГДА — законный «денег не хватило» становился неотличим от «данных
+    о балансе нет». Разбор гонки 43838096 (22.08) уткнулся ровно в это: бот был разоружён
+    по замыслу (поплавок 0.1568 HYPE против конверта 4.13 HYPE при base 825 gwei), а
+    запись сообщала null, то есть «неизвестно». Незнание обязано закрывать гард — но
+    ЗНАНИЕ обязано его открывать: три состояния должны быть тремя значениями.
+
+    None здесь — ровно один случай: баланс не прочитан.
+    """
+    if bal is None:
+        return None
+    return bal * 1e18 >= C.GAS_LIMIT * 2 * base
+
+
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -200,8 +218,7 @@ def _enrich(rpc, events: list[dict], our_view: dict, st_snapshot: dict) -> None:
                    "ours": {"in_book": our_view.get("in_book", {}).get(e["victim"].lower()),
                             "in_hot": our_view.get("in_hot", {}).get(e["victim"].lower()),
                             "size_ok": (debt_usd >= C.MIN_DEBT_USD) if debt_usd else None,
-                            "floor_ok": (bal is not None
-                                         and bal * 1e18 >= C.GAS_LIMIT * 2 * base) or None,
+                            "floor_ok": _floor_ok(bal, base),
                             "guard": st_snapshot.get("guard")}}
             _append(rec)
             if _above_fire_floor(debt_usd, bonus_usd):

@@ -224,3 +224,38 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# --- floor_ok: три состояния = три значения (разбор гонки 43838096, 22.08) --------------
+def test_floor_ok_three_states():
+    """Прежнее `(...) or None` НЕ МОГЛО вернуть False: законный «газа не хватило»
+    приходил в jsonl как null и был неотличим от «баланс не прочитан». Тест держит
+    именно средний случай — он и есть весь смысл правки."""
+    from bot import shadow, config as C
+
+    base_storm = 825_071_739_814                       # base блока 43838096, 825.07 gwei
+    envelope = C.GAS_LIMIT * 2 * base_storm / 1e18     # 4.13 HYPE при GAS_LIMIT=2.5M
+
+    # 1) баланс не прочитан -> None (единственный законный None)
+    assert shadow._floor_ok(None, base_storm) is None
+
+    # 2) боевой поплавок 20.08 против шторма -> ИМЕННО False, не None
+    assert shadow._floor_ok(0.156803, base_storm) is False
+
+    # 3) хватает -> True
+    assert shadow._floor_ok(envelope * 1.01, base_storm) is True
+
+    # 4) тихий фон (11.5 gwei): тот же поплавок вооружён
+    assert shadow._floor_ok(0.156803, 11_500_000_000) is True
+
+
+def test_floor_ok_negative_control():
+    """Негативный контроль К САМОМУ ТЕСТУ: воспроизводим СНЯТЫЙ дефект и убеждаемся,
+    что тест выше его ловит. Иначе суита зелена и с фиксом, и без него."""
+    from bot import config as C
+
+    base_storm = 825_071_739_814
+    bal = 0.156803
+    buggy = (bal is not None and bal * 1e18 >= C.GAS_LIMIT * 2 * base_storm) or None
+    assert buggy is None                                # старое поведение: False -> None
+    assert buggy is not False                           # ...и оно провалило бы кейс (2)
