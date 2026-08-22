@@ -1794,6 +1794,13 @@ def loop() -> None:
               f"contract={'set' if C.CONTRACT else 'NONE'}, hot-set HF<{C.HOT_HF} "
               f"poll {C.HOT_POLL_SEC}s / sweep {C.SWEEP_CHUNK}/iter of {len(book['borrowers'])}, "
               f"kill-switch gas ${C.MAX_DAILY_GAS_USD}/day, {C.MAX_CONSEC_REVERTS} reverts).")
+    # Пороги spec-слоя — ИЗ ПРОЦЕССА. Боевые значения приходят окружением (HL_SPEC_*), а
+    # «переменная записана в env» и «процесс её прочитал» — разные утверждения: между ними
+    # стоят порядок запуска, set -a, опечатка в имени и живой процесс, стартовавший ДО правки.
+    # Единственный годный свидетель живого порога — сам процесс (память acceptance-reference).
+    if C.SPEC_FIRE:
+        banner += (f" spec: HF<{C.SPEC_HF_FIRE:.6g}, dev>={C.SPEC_MIN_DEVIATION:.4g}, "
+                   f"tip {C.SPEC_TIP_GWEI} gwei, <={C.SPEC_MAX_PROBES} зондов/окно.")
     print(banner)
     # throttle repeat start banners too — a crash-loop under the cron watchdog must not spam
     if time.time() - st.get("last_start_alert", 0) > 600:

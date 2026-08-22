@@ -186,8 +186,13 @@ def test_plan_same_asset_does_NOT_self_cancel_when_shares_differ(caches, monkeyp
         spec._chain[(_A, "wstHYPE_FUNDAMENTAL")] = {"value": int(1.032421 * 1e8),
                                                     "ts_ms": now_ms - 240_000}
 
-    # 1) при БОЕВОМ пороге 0.998 плана нет — это и есть причина молчания слоя 22.08
-    assert C.SPEC_HF_FIRE == 0.998, "тест пришпилен к боевому порогу; порог сменился — перечитать вывод"
+    # 1) при пороге 0.998 плана нет — это и есть причина молчания слоя 22.08.
+    # 0.998 — ДЕФОЛТ КОДА (bot/config.py:242); боевое значение с 22.08 живёт в окружении
+    # (HL_SPEC_HF_FIRE в ~/.hyperlend-bot/env) и равно 0.9996. Прежний пин «C.SPEC_HF_FIRE == 0.998»
+    # снят намеренно: он описывал боевой порог величиной из кода и потому врал бы ровно с того
+    # момента, как боевое значение уехало в env, — а суита в боевом окружении ещё и краснела бы.
+    # Оба значения прогнаны через настоящий plan() в test_gate_threshold_acceptance_43827262.
+    monkeypatch.setattr(C, "SPEC_HF_FIRE", 0.998)
     assert spec.plan(acct, t) is None
 
     # 2) оценщик саму цель ВИДИТ и попадает в цепь: «самогашение» здесь не наступает
@@ -630,3 +635,129 @@ def test_plan_khype_against_khype_still_self_cancels(caches):
         spec._gw[_KHYPE_FEED] = _feed_cache(_KHYPE_FEED, 40.0, now_ms - 5_000)
         spec._chain[(_A, _KHYPE_FEED)] = {"value": int(51.0 * 1e8), "ts_ms": now_ms - 240_000}
     assert spec.plan(_acct(1.01), _t(_KHYPE, _KHYPE)) is None
+
+
+# --- приёмка порогов 22.08 (решение владельца по 43827262) --------------------------------------
+# Гейт в bot/spec.py строгий: огонь при hf_est < C.SPEC_HF_FIRE. Все числа ниже — ЗАМЕР
+# (перепись analysis/spec_gap.py census + разбор блока 43827262), а не самоотчёт слоя:
+# приёмка обязана стоять на эталоне из ОТДЕЛЬНОГО прохода.
+_HF_43827262_EST = 0.999566          # что даёт plan() на замеренных входах
+_HF_43827262_CHAIN = 0.999608        # что было на цепи (ошибка оценщика −4.2e-5)
+
+
+def _arm_43827262(dev_frac: float = 0.005039):
+    """Ставит кэши spec в состояние блока 43827262 и возвращает (acct, target).
+
+    dev_frac — девиация пуша HYPE долей единицы; по умолчанию замеренная 0.5039%.
+    Позиция: залог wstHYPE 387.073314 + USDT0 421.62 + USDC 18,633.22 ($50,371.61),
+    долг ЦЕЛИКОМ wstHYPE 453.904170 ($36,725.80) => f_c=0.6217, f_d=1.0.
+    """
+    HF, TC, TD = 1.001465, 50_371.61, 36_725.80
+    PX_WST, PX_HYPE_BEFORE = 80.910910, 78.370100
+    px_after = PX_HYPE_BEFORE * (1.0 + dev_frac)
+    acct = {"health_factor": int(HF * 1e18),
+            "total_collateral_base": int(TC * 1e8), "total_debt_base": int(TD * 1e8)}
+    t = {"coll_asset": _WSTHYPE, "debt_asset": _WSTHYPE,
+         "coll_wei": int(387.073314 * 1e18), "coll_price": int(PX_WST * 1e8), "coll_dec": 18,
+         "debt_wei": int(453.904170 * 1e18), "debt_price": int(PX_WST * 1e8), "debt_dec": 18}
+    now_ms = int(time.time() * 1000)
+    with spec._lock:
+        spec._gw["HYPE"] = _feed_cache("HYPE", px_after, now_ms - 5_000)
+        spec._chain[(_A, "HYPE")] = {"value": int(PX_HYPE_BEFORE * 1e8), "ts_ms": now_ms - 240_000}
+        # вторая нога фасада стоит на месте — её масштаб 1 (пуш её не вёз)
+        spec._gw["wstHYPE_FUNDAMENTAL"] = _feed_cache("wstHYPE_FUNDAMENTAL", 1.032421, now_ms - 5_000)
+        spec._chain[(_A, "wstHYPE_FUNDAMENTAL")] = {"value": int(1.032421 * 1e8),
+                                                    "ts_ms": now_ms - 240_000}
+    return acct, t
+
+
+@pytest.mark.parametrize("thr,fires,why", [
+    (0.998,  False, "прежний боевой порог — причина молчания слоя 22.08 (запас 0.2% = 48x ошибки)"),
+    (0.9995, False, "порог, названный в решении БУКВАЛЬНО: 0.999566 НЕ < 0.9995 — слой молчит снова"),
+    (0.9996, True,  "минимальный порог, удовлетворяющий приёмке владельца; запас 4.0e-4 = 9.5x ошибки"),
+])
+def test_gate_threshold_acceptance_43827262(caches, monkeypatch, thr, fires, why):
+    """Красным-на-базе для ручки HL_SPEC_HF_FIRE. Идёт через НАСТОЯЩИЙ spec.plan(), а не через
+    арифметику гейта, переписанную в тесте (урок 21.08: шов, подменённый выше дефекта, оставляет
+    суиту зелёной со снятым фиксом).
+
+    Строка 0.9995 — не гипотетика: ровно это значение стоит в решении, и именно она показывает,
+    что буквальная ручка приёмку владельца («цель класса 43827262 проходит гейт») НЕ проходит.
+    """
+    acct, t = _arm_43827262()
+    monkeypatch.setattr(C, "SPEC_HF_FIRE", thr)
+    p = spec.plan(acct, t)
+    assert (p is not None) is fires, why
+    if fires:
+        assert p["feeds"] == ["HYPE"]
+        assert p["hf_est"] == pytest.approx(_HF_43827262_EST, abs=1e-6)
+        assert p["hf_est"] < 1.0, "цель обязана быть ПОД водой по оценке, иначе зонд заведомо мимо"
+
+
+def test_gate_never_admits_a_target_that_did_not_cross(caches, monkeypatch):
+    """Вторая половина приёмки: «шум режется по-прежнему». Пересечение 42901129 (HF_est ровно
+    1.000000, замер) не проходит НИ ПРИ КАКОМ пороге <= 1.0 — гейт остаётся гейтом, а не
+    отключается вместе с подъёмом."""
+    acct, t = _arm_43827262(dev_frac=0.0)      # пуша нет => масштабы 1 => HF_est == HF > 1
+    for thr in (0.998, 0.9995, 0.9996, 1.0):
+        monkeypatch.setattr(C, "SPEC_HF_FIRE", thr)
+        assert spec.plan(acct, t) is None, f"порог {thr} пропустил цель, которая воду не пересекла"
+
+
+@pytest.mark.parametrize("dev_frac,min_dev,opens", [
+    (0.003533, 0.005,  False),   # минимальный ПРИНЯТЫЙ релейером шаг — старый порог его не видит
+    (0.003533, 0.0035, True),    # ...и видит новый
+    (0.003000, 0.0035, False),   # гейт не снят: шаг ниже нового порога по-прежнему игнорируется
+])
+def test_deviation_gate_acceptance(caches, monkeypatch, dev_frac, min_dev, opens):
+    """Красным-на-базе для ручки HL_SPEC_MIN_DEVIATION. Замер analysis/spec_gap.py devs:
+    136 пушей за 8ч, 25 (18%) ниже 0.50%, минимальный принятый шаг 0.3533% — значит у релейера
+    есть не только девиационный, но и хартбит-повод, и слой слеп к ~18% пушей ПО ПОСТРОЕНИЮ.
+
+    Порог HF здесь открыт ЗАВЕДОМО ШИРЕ боевого (1.01): проверяется РОВНО девиационный рубеж.
+    Иначе тест судил бы о двух гейтах разом — на шаге 0.3533% эта цель воду не пересекает
+    (HF_est ~ 1.00013), и её задержал бы HF-гейт, а не девиационный; вывод «порог девиации не
+    работает» был бы ложным. Боевую связку двух гейтов проверяет
+    test_gate_threshold_acceptance_43827262."""
+    acct, t = _arm_43827262(dev_frac=dev_frac)
+    monkeypatch.setattr(C, "SPEC_HF_FIRE", 1.01)
+    monkeypatch.setattr(C, "SPEC_MIN_DEVIATION", min_dev)
+    p = spec.plan(acct, t)
+    assert (p is not None) is opens
+    if opens:
+        assert p["feeds"] == ["HYPE"]
+
+
+# Перепись пересечений В БЛОКЕ за 14 суток (analysis/spec_gap.py census, замер 22.08):
+# (блок, полный долг позиции $, HF_est, кто взял). Эталон из отдельного прохода.
+_CROSSINGS = [
+    (43827262, 36_726, 0.999566, "0x2f18fc90"),
+    (43626345,    174, 0.999364, "0xae86edb5"),
+    (43626003,    141, 0.999049, "0xae86edb5"),
+    (43828610,    115, 0.997734, "0xae86edb5"),
+    (42901129,     14, 1.000000, "0xae86edb5"),
+    (42894450,     14, 0.998700, "0xae86edb5"),
+    (43827324,      8, 0.999565, "0xae86edb5"),
+    (43160650,      7, 0.999604, "0xae86edb5"),
+    (43141999,      7, 0.999736, "0xae86edb5"),
+    (43127904,      7, 0.999980, "0xae86edb5"),
+]
+
+
+def test_census_gate_arithmetic_old_vs_new():
+    """Что именно покупает подъём порога — на замеренной переписи, а не на догадке.
+
+    Денежная возможность за 14 суток была РОВНО одна (43827262, премия $2,491), и её съел
+    собственный запас гейта. Единственное, что старый порог пропускал, — $115, то есть ниже
+    нашего же размерного фильтра: слой был открыт только там, где деньги нам не полагались.
+    """
+    def fires(thr, min_debt):
+        return [b for b, d, hf, _ in _CROSSINGS if hf < thr and d >= min_debt]
+
+    assert fires(0.998, 0) == [43828610], "старый порог пропускал одно пересечение из десяти"
+    assert fires(0.998, 500) == [], "и это одно — ниже размерного фильтра: денег там не было"
+    assert fires(0.9996, 500) == [43827262], "новый порог открывает ровно денежный класс"
+    # Размерный фильтр не тронут и продолжает резать пыль сам по себе.
+    assert [b for b, d, _, _ in _CROSSINGS if d >= C.MIN_DEBT_USD] == [43827262]
+    # Порог остаётся ниже единицы с запасом, измеренным по ошибке оценщика.
+    assert 1.0 - 0.9996 > 9 * abs(_HF_43827262_CHAIN - _HF_43827262_EST)
