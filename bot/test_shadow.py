@@ -259,3 +259,50 @@ def test_floor_ok_negative_control():
     buggy = (bal is not None and bal * 1e18 >= C.GAS_LIMIT * 2 * base_storm) or None
     assert buggy is None                                # старое поведение: False -> None
     assert buggy is not False                           # ...и оно провалило бы кейс (2)
+
+
+# ------------------------------------------------------- вскрытие 23.08 (43989968): пара (адаптер, фид)
+# ФИКСТУРА — ЗАМЕР с цепи: два пуша одного и того же значения HYPE=83.1266865 в ОДНОМ блоке,
+# в РАЗНЫЕ адаптеры. Оракул HyperLend для WHYPE читает только 0xe4ae8874 (доказано: latestAnswer
+# фида на 43989967 = 82.7834087 = значение 0xe4ae8874, у 0x24c89643 там 82.651734), поэтому пуш
+# релеера на idx0 гонкой НЕ был, хотя upd у него = 1 и он стоит в блоке перед победителем.
+_RS = C.TOPIC_VALUE_UPDATE
+_ADAPTER_RELAYER = "0x24c8964338deb5204b096039147b8e8c3aea42cc"   # оракул WHYPE его НЕ читает
+_ADAPTER_ORACLE = "0xe4ae88743c3834d0c492eabc47384c84bcadc6a6"    # его читает source WHYPE
+
+
+def _rs_log(addr: str, feed: bytes, value: int = 8312668650, ts: int = 1787524989) -> dict:
+    data = "0x" + f"{value:064x}" + feed.ljust(32, b"\x00").hex() + f"{ts:064x}"
+    return {"address": addr, "topics": [_RS], "data": data}
+
+
+def test_upd_src_separates_adapters_of_the_same_price() -> None:
+    """idx0 релеера и idx3 победителя несут ОДНУ цену — различает их только адаптер."""
+    relayer = S._upd_sources({"logs": [_rs_log(_ADAPTER_RELAYER, b"HYPE")]})
+    winner = S._upd_sources({"logs": [_rs_log(_ADAPTER_ORACLE, b"HYPE")]})
+    assert relayer == [[_ADAPTER_RELAYER[:14], "HYPE"]]
+    assert winner == [[_ADAPTER_ORACLE[:14], "HYPE"]]
+    # счётчик upd (прежний признак) на этих двух записях НЕ различается — потому пара и нужна
+    assert len(relayer) == len(winner) == 1
+    assert relayer != winner
+
+
+def test_upd_src_ignores_foreign_topics_and_never_guesses_feed() -> None:
+    rc = {"logs": [{"address": "0x" + "11" * 20, "topics": ["0x" + "ab" * 32], "data": "0x"},
+                   {"address": "0x" + "22" * 20, "topics": [], "data": "0x"},
+                   {"address": "0x" + "33" * 20, "topics": [S.TOPIC_PYTH_PRICE_UPDATE],
+                    "data": "0x" + "00" * 96},
+                   _rs_log(_ADAPTER_ORACLE, b"SOL")]}
+    out = S._upd_sources(rc)
+    assert len(out) == 2                       # посторонние топики и пустой topics — мимо
+    assert out[0] == ["0x" + "33" * 6, None]   # у Pyth фид не угадываем, а None
+    assert out[1] == [_ADAPTER_ORACLE[:14], "SOL"]
+
+
+def test_upd_src_survives_short_and_broken_data() -> None:
+    """Нечитаемый фид не роняет запись и не превращается в догадку (телеметрия важнее)."""
+    short = {"address": _ADAPTER_ORACLE, "topics": [_RS], "data": "0x" + "00" * 32}
+    assert S._upd_sources({"logs": [short]}) == [[_ADAPTER_ORACLE[:14], None]]
+    nonascii = {"address": _ADAPTER_ORACLE, "topics": [_RS],
+                "data": "0x" + "00" * 32 + "ff" * 32 + "00" * 32}
+    assert S._upd_sources({"logs": [nonascii]}) == [[_ADAPTER_ORACLE[:14], None]]

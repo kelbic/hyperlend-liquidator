@@ -109,6 +109,38 @@ def _asset_price_usd(rpc, asset: str) -> float | None:
         return None
 
 
+def _upd_sources(rc: dict) -> list[list]:
+    """Куда именно ушёл апдейт: [адаптер, фид] по каждому оракул-событию квитанции.
+
+    Вскрытие 43989968 (23.08): в блоке было ДВА пуша с одинаковой ценой HYPE=83.1266865 —
+    релеер на idx0 в адаптер 0x24c8964338de и сам победитель на idx3 в адаптер 0xe4ae8874.
+    Оракул HyperLend для WHYPE (source 0xb6022412, имплементация 0x2e65b1a4) читает ТОЛЬКО
+    0xe4ae8874: на предыдущем блоке latestAnswer фида = 82.7834087 = значение 0xe4ae8874,
+    а не 82.651734 у 0x24c89643. То есть пуш релеера оракул не двинул ВООБЩЕ, и «пуш в блоке
+    перед победителем» (push_idx) реактивной гонкой не был. Голый счётчик upd этого не
+    различает — различает пара (адаптер, фид), сверенная с активами жертвы.
+
+    Прибор пишет пару СЫРОЙ: сопоставление с активом делает разбор (карта пар живёт в
+    bot/spec.py и дрейфует), иначе телеметрия соврёт вместе с картой. Фид декодируется
+    только у RedStone ValueUpdate (data: value, bytes32 feedId, ts); у прочих топиков — None,
+    а не догадка."""
+    out: list[list] = []
+    for lg in rc.get("logs", []):
+        t0 = lg["topics"][0] if lg.get("topics") else None
+        if t0 not in _TOPIC_ORACLE_UPDATES:
+            continue
+        feed = None
+        if t0 == C.TOPIC_VALUE_UPDATE:
+            d = lg.get("data", "0x")[2:]
+            if len(d) >= 128:
+                try:
+                    feed = bytes.fromhex(d[64:128]).rstrip(b"\x00").decode("ascii") or None
+                except Exception:        # noqa: BLE001 — нечитаемый фид не портит запись
+                    feed = None
+        out.append([lg.get("address", "")[:14], feed])
+    return out
+
+
 def _push_indices(anatomy: list[dict]) -> list[int]:
     """Индексы tx блока, которые РЕАЛЬНО двинули оракул — по факту события в квитанции
     (upd>0), а не по силуэту tx.
@@ -190,8 +222,7 @@ def _enrich(rpc, events: list[dict], our_view: dict, st_snapshot: dict) -> None:
                        "inb": len(t.get("input", "0x")) // 2 - 1,
                        # оракул-апдейты внутри tx (Pyth PriceFeedUpdate / RS ValueUpdate):
                        # upd>0 у победителя = атомарный self-push, гонка была невыигрываема
-                       "upd": sum(1 for lg in rc.get("logs", [])
-                                  if lg["topics"] and lg["topics"][0] in _TOPIC_ORACLE_UPDATES)}
+                       "upd": len(_upd_sources(rc)), "upd_src": _upd_sources(rc)}
                 anatomy.append(row)
                 if t["hash"] == e["tx"]:
                     win = row
