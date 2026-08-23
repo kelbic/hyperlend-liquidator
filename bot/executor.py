@@ -228,6 +228,13 @@ _last_balance_check = 0.0
 _last_balance_alert = 0.0
 
 
+def _mute_until_str() -> str:
+    """Разрешённый процессом момент истечения ⛽-глушилки, UTC. Печатается и в баннере, и в
+    заглушённой строке лога: живым свидетелем порога может быть только сам процесс, а не то,
+    что записано в env (память acceptance-reference-not-self-report)."""
+    return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(C.LOW_GAS_MUTE_UNTIL))
+
+
 def check_balance(st: dict, now_ts: float, force: bool = False) -> bool:
     """EOA gas-balance guard (ported from katana, which learned it the hard way: there was NO
     guard here either, so a drained wallet would surface ONLY as an 'insufficient funds'
@@ -261,9 +268,22 @@ def check_balance(st: dict, now_ts: float, force: bool = False) -> bool:
         return True
     if now_ts - _last_balance_alert > C.BALANCE_ALERT_SEC:
         _last_balance_alert = now_ts
-        alert(f"⛽ LOW GAS BALANCE: {bal / 1e18:.4f} HYPE < floor {need / 1e18:.4f} HYPE "
-              f"(node needs GAS_LIMIT×maxFee = {C.GAS_LIMIT * max_fee / 1e18:.4f} HYPE per fire). "
-              f"Бот НЕ СМОЖЕТ выстрелить — пополнить {addr}.")
+        msg = (f"⛽ LOW GAS BALANCE: {bal / 1e18:.4f} HYPE < floor {need / 1e18:.4f} HYPE "
+               f"(node needs GAS_LIMIT×maxFee = {C.GAS_LIMIT * max_fee / 1e18:.4f} HYPE per fire). "
+               f"Бот НЕ СМОЖЕТ выстрелить — пополнить {addr}.")
+        # Глушилка гасит КАНАЛ, а не наблюдение: строка уходит в лог, и на том же часовом троттле
+        # (_last_balance_alert двигается в ОБЕИХ ветках — иначе снятие глушилки дало бы залп).
+        # Это строго ЛУЧШЕ прежнего поведения: успешно ОТПРАВЛЕННАЯ тревога не оставляла в логе
+        # ни следа (alert() печатает только при муте транспорта или отказе), и «была ли она»
+        # приходилось узнавать из чужого чата.
+        if C.LOW_GAS_MUTE_UNTIL > now_ts:
+            print(f"[⛽ low-gas ГЛУШИЛКА до {_mute_until_str()}] {msg}")
+        else:
+            # Истечение обязано объяснять себя само: без оговорки возобновившийся сигнал читается
+            # как НОВЫЙ инцидент, и владелец спросит «почему опять».
+            if C.LOW_GAS_MUTE_UNTIL > 0:
+                msg += f" (глушилка истекла {_mute_until_str()})"
+            alert(msg)
     return False
 
 
@@ -1801,6 +1821,15 @@ def loop() -> None:
     if C.SPEC_FIRE:
         banner += (f" spec: HF<{C.SPEC_HF_FIRE:.6g}, dev>={C.SPEC_MIN_DEVIATION:.4g}, "
                    f"tip {C.SPEC_TIP_GWEI} gwei, <={C.SPEC_MAX_PROBES} зондов/окно.")
+    # Состояние ⛽-глушилки — ИЗ ПРОЦЕССА. Молчащая тревога обязана быть видимой в баннере,
+    # иначе «сторож молчит» неотличимо от «сторожа выключили» (dead-watchdog-worse-than-none).
+    if C.LOW_GAS_MUTE_RAW:
+        if C.LOW_GAS_MUTE_UNTIL <= 0:
+            banner += (f" ⛽-глушилка НЕ РАСПОЗНАНА ({C.LOW_GAS_MUTE_RAW!r}) — тревога РАБОТАЕТ.")
+        elif C.LOW_GAS_MUTE_UNTIL > time.time():
+            banner += f" ⛽-тревога ГЛУШЕНА до {_mute_until_str()} (гард огня не тронут)."
+        else:
+            banner += f" ⛽-глушилка ИСТЕКЛА {_mute_until_str()} — тревога РАБОТАЕТ."
     print(banner)
     # throttle repeat start banners too — a crash-loop under the cron watchdog must not spam
     if time.time() - st.get("last_start_alert", 0) > 600:

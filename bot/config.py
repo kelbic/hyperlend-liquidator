@@ -4,6 +4,7 @@ idiom as the wc/katana bots — the same code runs in dry-run, fork, and live wi
 """
 from __future__ import annotations
 import os
+from datetime import datetime, timezone
 
 from analysis.protocols import (
     ADDRESSES_PROVIDER, ORACLE, POOL, POOL_DATA_PROVIDER, FLASHLOAN_PREMIUM_BPS,
@@ -101,6 +102,35 @@ HYPE_USD = float(os.environ.get("HL_HYPE_USD", "45"))           # rough, gas-USD
 BALANCE_CHECK_SEC = float(os.environ.get("HL_BALANCE_CHECK_SEC", "600"))
 BALANCE_ALERT_SEC = float(os.environ.get("HL_BALANCE_ALERT_SEC", "3600"))
 BALANCE_FIRES = int(os.environ.get("HL_BALANCE_FIRES", "3"))
+
+# --- ГЛУШИЛКА тревоги ⛽ LOW GAS (23.08) --------------------------------------------------------
+# Глушится ТОЛЬКО КАНАЛ. Гард огня (check_balance -> False) остаётся нетронутым: нода всё равно
+# отвергнет tx при balance < GAS_LIMIT*maxFee, и «не стрелять» здесь не наша политика, а физика.
+# Повод: владелец знает о недоборе газа и пока не может пополнять, а тревога уходила в TG раз в час.
+#
+# ФОРМА — ДАТА, А НЕ БУЛЕВА РУЧКА, И ЭТО НАМЕРЕННО. Временный обход порога переживает свою
+# гипотезу (память alerts-only-where-human-acts, случай 31.07: разведочный обход остался после
+# того, как окно прошло, и превратился в спам). Булев флаг нечем закрыть; дата закрывает себя сама.
+# Формат UTC: "YYYY-MM-DD" | "YYYY-MM-DDTHH:MM" | "YYYY-MM-DDTHH:MM:SS". Пусто = глушилки нет.
+#
+# НЕРАЗОБРАННАЯ СТРОКА = ГЛУШИЛКИ НЕТ (тревога работает). Незнание здесь закрывает не гард, а сам
+# обход: опечатка в дате не имеет права молча выключить сигнал о том, что бот не может стрелять.
+# Отличать «не задана» (0.0) от «задана, но мусор» (-1.0) обязательно — баннер докладывает разное.
+LOW_GAS_MUTE_RAW = os.environ.get("HL_LOW_GAS_MUTE_UNTIL", "").strip()
+
+
+def _parse_mute_until(raw: str) -> float:
+    if not raw:
+        return 0.0
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return -1.0
+
+
+LOW_GAS_MUTE_UNTIL = _parse_mute_until(LOW_GAS_MUTE_RAW)
 
 POLL_SEC = float(os.environ.get("HL_POLL_SEC", "3"))            # base cadence (legacy once-loop only)
 # --- amortized hot-set loop (see bot/executor.py loop()) ---------------------------------------

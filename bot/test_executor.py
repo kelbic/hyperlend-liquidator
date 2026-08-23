@@ -15,6 +15,7 @@ and the 2026-07-18 fire-path latency fix:
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 import threading
@@ -1338,6 +1339,126 @@ def test_balance_alert_is_throttled():
         assert len(alerts) == 1, alerts
     finally:
         _balance_restore(o)
+
+
+# --------------------------------------------------------------- ⛽-глушилка (23.08, владелец)
+# Владелец знает о недоборе газа и пока не может пополнять — тревога раз в час стала шумом.
+# Глушится КАНАЛ. Всё, что ниже, проверяет ровно две вещи: канал молчит там и только там, где
+# велено, и ГАРД ОГНЯ при этом не сдвинулся ни на шаг.
+
+def _mute_save():
+    return (C.LOW_GAS_MUTE_RAW, C.LOW_GAS_MUTE_UNTIL)
+
+
+def _mute_restore(o):
+    C.LOW_GAS_MUTE_RAW, C.LOW_GAS_MUTE_UNTIL = o
+
+
+def _run_underfunded(now=None):
+    """Один прогон гарда на осушённом EOA; возвращает (вернул_ли_False, ушедшие_алерты, лог)."""
+    import contextlib
+    o = _balance_ctx(bal_wei=1)
+    alerts = []
+    E.alert = lambda text, **kw: alerts.append(text)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            gate = E.check_balance({}, _T0 if now is None else now, force=True)
+    finally:
+        _balance_restore(o)
+    return gate, alerts, buf.getvalue()
+
+
+def test_low_gas_mute_swallows_the_alert_but_keeps_it_in_the_log():
+    """Действующая глушилка: в TG не уходит НИЧЕГО, в лог уходит ВСЁ.
+
+    Наблюдение при этом не теряется, а ПОЯВЛЯЕТСЯ: успешно отправленная тревога до этой правки
+    не оставляла в логе ни следа (alert() печатает только при муте транспорта или отказе)."""
+    o = _mute_save()
+    try:
+        C.LOW_GAS_MUTE_RAW, C.LOW_GAS_MUTE_UNTIL = "2099-01-01", _T0 + 86400
+        gate, alerts, log = _run_underfunded()
+        assert alerts == [], alerts
+        assert "LOW GAS BALANCE" in log, log
+        assert "ГЛУШИЛКА" in log, log
+    finally:
+        _mute_restore(o)
+
+
+def test_low_gas_mute_does_not_touch_the_fire_gate():
+    """САМОЕ ВАЖНОЕ. Глушится канал, а не гард: недофинансированный кошелёк по-прежнему
+    запрещает выстрел. Обратное было бы не «тише», а «стреляем в ноду, которая отвергнет tx»."""
+    o = _mute_save()
+    try:
+        C.LOW_GAS_MUTE_RAW, C.LOW_GAS_MUTE_UNTIL = "2099-01-01", _T0 + 86400
+        gate, _alerts, _log = _run_underfunded()
+        assert gate is False, "глушилка НЕ СМЕЕТ открывать огонь при пустом кошельке"
+    finally:
+        _mute_restore(o)
+
+
+def test_low_gas_mute_expired_alerts_and_says_so():
+    """Истёкшая глушилка снова звонит — и объясняет себя. Без оговорки возобновление читается
+    как НОВЫЙ инцидент (урок 31.07: у обхода обязан быть срок годности, и он обязан быть виден)."""
+    o = _mute_save()
+    try:
+        C.LOW_GAS_MUTE_RAW, C.LOW_GAS_MUTE_UNTIL = "2020-01-01", _T0 - 86400
+        gate, alerts, _log = _run_underfunded()
+        assert gate is False
+        assert len(alerts) == 1, alerts
+        assert "глушилка истекла" in alerts[0], alerts[0]
+    finally:
+        _mute_restore(o)
+
+
+def test_low_gas_mute_garbage_date_leaves_the_alarm_ON():
+    """Опечатка в дате НЕ ИМЕЕТ ПРАВА молча выключить сигнал. Незнание закрывает не гард, а сам
+    обход: -1.0 («задана, но мусор») ведёт себя как «глушилки нет», и баннер это докладывает."""
+    o = _mute_save()
+    try:
+        C.LOW_GAS_MUTE_RAW = "завтра"
+        C.LOW_GAS_MUTE_UNTIL = C._parse_mute_until("завтра")
+        assert C.LOW_GAS_MUTE_UNTIL == -1.0
+        _gate, alerts, _log = _run_underfunded()
+        assert len(alerts) == 1, alerts
+        assert "глушилка истекла" not in alerts[0], "мусор — это не истечение"
+    finally:
+        _mute_restore(o)
+
+
+def test_low_gas_mute_shares_the_throttle_with_the_alert():
+    """Троттл двигается в ОБЕИХ ветках. Иначе снятие глушилки дало бы залп: заглушённые проходы
+    не потратили бы час, и первый же незаглушённый выстрелил бы поверх свежего."""
+    o, om = _balance_ctx(bal_wei=1), _mute_save()
+    import contextlib
+    alerts = []
+    E.alert = lambda text, **kw: alerts.append(text)
+    try:
+        C.LOW_GAS_MUTE_RAW, C.LOW_GAS_MUTE_UNTIL = "2099-01-01", _T0 + 86400
+        with contextlib.redirect_stdout(io.StringIO()):
+            E.check_balance({}, _T0, force=True)          # заглушено, но час потрачен
+        C.LOW_GAS_MUTE_RAW, C.LOW_GAS_MUTE_UNTIL = "", 0.0   # глушилку сняли сразу же
+        with contextlib.redirect_stdout(io.StringIO()):
+            E.check_balance({}, _T0 + 1, force=True)      # тот же час — молчим
+        assert alerts == [], alerts
+        with contextlib.redirect_stdout(io.StringIO()):
+            E.check_balance({}, _T0 + C.BALANCE_ALERT_SEC + 2, force=True)
+        assert len(alerts) == 1, alerts
+    finally:
+        _mute_restore(om)
+        _balance_restore(o)
+
+
+def test_mute_until_parses_the_three_documented_forms():
+    """Разбор даты — по трём заявленным формам, всегда UTC, и «пусто» отличимо от «мусор»."""
+    assert C._parse_mute_until("") == 0.0
+    assert C._parse_mute_until("   ".strip()) == 0.0
+    day = C._parse_mute_until("2026-08-30")
+    assert C._parse_mute_until("2026-08-30T00:00") == day
+    assert C._parse_mute_until("2026-08-30T00:00:00") == day
+    assert C._parse_mute_until("2026-08-30T12:00") == day + 12 * 3600
+    assert C._parse_mute_until("30.08.2026") == -1.0        # не наша форма — мусор, не тишина
+    assert C._parse_mute_until("2026-13-40") == -1.0
 
 
 if __name__ == "__main__":
