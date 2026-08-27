@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -222,8 +223,6 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
 
 
 # --- floor_ok: три состояния = три значения (разбор гонки 43838096, 22.08) --------------
@@ -306,3 +305,58 @@ def test_upd_src_survives_short_and_broken_data() -> None:
     nonascii = {"address": _ADAPTER_ORACLE, "topics": [_RS],
                 "data": "0x" + "00" * 32 + "ff" * 32 + "00" * 32}
     assert S._upd_sources({"logs": [nonascii]}) == [[_ADAPTER_ORACLE[:14], None]]
+
+
+# --- посмертный in_hot: часы наблюдения hot-set (разбор гонки 44314803, 27.08) ----------
+def test_hot_age_survives_post_mortem_drop() -> None:
+    """Воспроизводит ЛОЖЬ прибора, ради которой часы и заведены. Жертва велась в hot-set,
+    её съели целиком, долг обнулился -> HF=inf -> update_hotset() выбросил адрес, и
+    our_view, снимаемый ПОСЛЕ события, честно говорит in_hot=False про цель, которую мы
+    вели минутами. Возраст обязан пережить выброс; горизонт наблюдения обязан ехать рядом
+    (две координаты: возраст субъекта И глубина наблюдения)."""
+    v = "0x85b9899118fac92ca10a429361a13161af63f34e"
+    S._hot_seen.clear()
+    S._state["seen_since"] = 0.0
+    S._state["last_tick"] = 0.0
+
+    class FakeRpc:
+        def block_number(self): return 44314803
+        def get_logs(self, *a, **k): return []
+
+    # У сторожа два выхода: тревога и ЗАЩЁЛКА. Канал тут молчит сам (событий нет), а вот
+    # _save_ckpt() пишет БОЕВОЙ chekpoint — уводим путь, иначе стенд сдвинет живой сторож
+    # (урок 27.08: замученный канал не спасает от не-канальной двери).
+    ckpt_orig = S.C.SHADOW_CKPT
+    S.C.SHADOW_CKPT = os.path.join(tempfile.mkdtemp(), "shadow_ckpt.json")
+
+    t = [1000.0]
+    orig_mono = S.time.monotonic
+    S.time.monotonic = lambda: t[0]
+    try:
+        # тик 1: адрес горячий, ликвидаций нет — часы обязаны тикать и на ПУСТОМ тике,
+        # иначе прибор помнит hot-set только в те тики, когда кто-то ликвидировал.
+        S.tick(FakeRpc(), {"borrowers": [v]}, {"hot": [v]}, {})
+        assert S._hot_seen.get(v) == 1000.0, S._hot_seen
+        # тик 2 (через 90с): жертву съели, из hot-set она выпала
+        t[0] = 1090.0
+        S._state["last_tick"] = 0.0            # снять троттлинг, каденс тут не проверяем
+        S.tick(FakeRpc(), {"borrowers": [v]}, {"hot": []}, {})
+    finally:
+        S.time.monotonic = orig_mono
+        S.C.SHADOW_CKPT = ckpt_orig
+
+    # адрес выброшен из hot, но часы его помнят
+    assert v in S._hot_seen and S._hot_seen[v] == 1000.0
+    ours = {"in_hot": False, "hot_age_sec": 1090.0 - 1000.0, "seen_horizon_sec": 90.0}
+    assert "90с назад" in S._hot_phrase(ours), S._hot_phrase(ours)
+    # НЕГАТИВНЫЙ КОНТРОЛЬ: адрес, которого не видели — «не видели» печатается ВМЕСТЕ с
+    # глубиной наблюдения, а не как факт про бот
+    unseen = {"in_hot": False, "hot_age_sec": None, "seen_horizon_sec": 90.0}
+    assert "за 90с наблюдения" in S._hot_phrase(unseen), S._hot_phrase(unseen)
+    # и без горизонта прибор не смеет утверждать ничего
+    assert "неизвестна" in S._hot_phrase({"in_hot": False})
+    S._hot_seen.clear()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

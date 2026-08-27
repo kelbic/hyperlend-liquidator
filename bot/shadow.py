@@ -35,7 +35,14 @@ SEL_GET_ASSET_PRICE = "0xb3596f07"          # getAssetPrice(address) -> uint256 
 TOPIC_PYTH_PRICE_UPDATE = "0xd06a6b7f4918494b3719217d1802786c1f5112a6c1d88fe2cfec00b4584f6aec"
 _TOPIC_ORACLE_UPDATES = {TOPIC_PYTH_PRICE_UPDATE, C.TOPIC_VALUE_UPDATE}
 ANATOMY_MAX_TX = 12                         # потолок разбора блока; превышение помечается trunc
-_state = {"last_tick": 0.0}
+_state = {"last_tick": 0.0, "seen_since": 0.0}
+# Часы наблюдения hot-set: адрес -> monotonic последнего тика, на котором он БЫЛ горячим.
+# Нужны потому, что our_view снимается УЖЕ ПОСЛЕ чужой ликвидации: полная ликвидация
+# обнуляет долг -> HF=inf -> update_hotset() выбрасывает адрес, и посмертный снимок
+# показывает in_hot=False у цели, которую мы вели минутами (вскрытие 27.08, блок 44314803:
+# жертва была на кромке pre-arm 15:22:46-15:28:33, «armed» 59 раз, а тревога сказала False).
+# in_hot оставлен как есть — ломать историю поля нельзя, честность даёт ВОЗРАСТ рядом с ним.
+_hot_seen: dict = {}                        # addr(lower) -> monotonic последнего «горячего» тика
 _price_cache: dict = {}                     # asset -> (price_usd, monotonic_ts)
 
 
@@ -186,6 +193,18 @@ def _notify_inbox(text: str, key: str) -> None:
         print(f"  shadow: inbox недоступен ({e}); событие только в jsonl")
 
 
+def _hot_phrase(ours: dict) -> str:
+    """Человекочитаемое покрытие цели. Две координаты, а не одна (урок ложных 💀): возраст
+    субъекта в hot-set И глубина собственного наблюдения. «Не видели» при горизонте в 20с
+    не значит «не вели» — так и печатаем."""
+    age, horizon = ours.get("hot_age_sec"), ours.get("seen_horizon_sec")
+    if age is not None:
+        return f"была в hot-set {age:.0f}с назад (in_hot={ours.get('in_hot')} — снимок посмертный)"
+    if horizon is None:
+        return f"in_hot={ours.get('in_hot')}, глубина наблюдения неизвестна"
+    return f"горячей не видели за {horizon:.0f}с наблюдения (in_hot={ours.get('in_hot')})"
+
+
 def _decode(lg: dict) -> dict:
     d = lg["data"][2:]
     return {"block": int(lg["blockNumber"], 16), "tx": lg["transactionHash"],
@@ -248,6 +267,11 @@ def _enrich(rpc, events: list[dict], our_view: dict, st_snapshot: dict) -> None:
                    "idx_shift": shift,
                    "ours": {"in_book": our_view.get("in_book", {}).get(e["victim"].lower()),
                             "in_hot": our_view.get("in_hot", {}).get(e["victim"].lower()),
+                            # in_hot — ПОСМЕРТНЫЙ снимок; судить покрытие по hot_age_sec:
+                            # None = за всю глубину наблюдения горячим не видели, и тогда
+                            # seen_horizon_sec говорит, чего эта глубина стоит.
+                            "hot_age_sec": our_view.get("hot_age", {}).get(e["victim"].lower()),
+                            "seen_horizon_sec": our_view.get("seen_horizon"),
                             "size_ok": (debt_usd >= C.MIN_DEBT_USD) if debt_usd else None,
                             "floor_ok": _floor_ok(bal, base),
                             "guard": st_snapshot.get("guard")}}
@@ -259,7 +283,7 @@ def _enrich(rpc, events: list[dict], our_view: dict, st_snapshot: dict) -> None:
                     f"${debt_usd:,.0f} (бонус ~${bonus_usd:,.0f}) блок {e['block']} "
                     f"tip {win['tip_gwei'] if win else '?'} gwei{self_push}, "
                     f"победитель {e['liquidator'][:10]}; "
-                    f"жертва in_hot={rec['ours']['in_hot']} — разобрать по shadow_races.jsonl",
+                    f"жертва {_hot_phrase(rec['ours'])} — разобрать по shadow_races.jsonl",
                     key=f"shadow:{e['tx'][:18]}")
         except Exception as ex:              # noqa: BLE001 — телеметрия не смеет ронять поток
             _append({"iso": _now_iso(), "err": str(ex)[:200], **e})
@@ -273,6 +297,13 @@ def tick(rpc, book: dict, hs: dict, st: dict) -> None:
     if now - _state["last_tick"] < C.SHADOW_EVERY_SEC:
         return
     _state["last_tick"] = now
+    # Часы наблюдения штампуем ДО любого RPC и ДО раннего return по «событий нет»: иначе
+    # прибор помнит hot-set только в те тики, когда кто-то ликвидировал (шов бы стоял этажом
+    # выше дефекта). Горизонт засевается ВОЗРАСТОМ НАБЛЮДЕНИЯ, а не «сейчас».
+    if not _state["seen_since"]:
+        _state["seen_since"] = now
+    for a in hs.get("hot", []):
+        _hot_seen[a.lower()] = now
     try:
         head = rpc.block_number()
         frm = _load_ckpt() + 1
@@ -295,7 +326,9 @@ def tick(rpc, book: dict, hs: dict, st: dict) -> None:
     hot = {a.lower() for a in hs.get("hot", [])}
     borrowers = {a.lower() for a in book.get("borrowers", [])}
     our_view = {"in_book": {v: v in borrowers for v in victims},
-                "in_hot": {v: v in hot for v in victims}}
+                "in_hot": {v: v in hot for v in victims},
+                "hot_age": {v: (now - _hot_seen[v]) for v in victims if v in _hot_seen},
+                "seen_horizon": now - _state["seen_since"]}
     snap = {"balance_hype": st.get("balance_hype"),
             "guard": "ok" if st.get("consec_reverts", 0) < C.MAX_CONSEC_REVERTS else "tripped"}
     threading.Thread(target=_enrich, args=(rpc, events, our_view, snap), daemon=True).start()
